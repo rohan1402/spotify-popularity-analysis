@@ -1,0 +1,307 @@
+---
+title: "Feature Engineering — Spotify Tracks Dataset"
+subtitle: "MSDS 16:954:567 – Statistical Models and Computing"
+author: "Group 16 - Rohan Pant (rp1610) & Pranav Immaneni (pi83)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 7,
+  fig.height = 5,
+  dpi        = 72
+)
+```
+
+## Overview
+
+With the data cleaned and explored, this notebook prepares the final modeling dataset. The steps here are motivated directly by the EDA findings:
+
+- **Duration outliers** were flagged in Section 9 of the EDA — we remove them now.
+- **`time_signature`** and **`key`** showed near-zero variance and no relationship with popularity — we drop them.
+- **Numeric features** are standardized so that regression coefficients are comparable across features with very different scales (e.g. loudness in dB vs. tempo in BPM).
+
+The output of this notebook — `data/spotify_model.rds` — is the direct input to the PCA and regression scripts.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+library(tidyverse)
+```
+
+---
+
+## 2. Load Data
+
+```{r load-data}
+df <- readRDS("../data/spotify_cleaned.rds")
+cat("Loaded:", nrow(df), "rows x", ncol(df), "columns\n")
+```
+
+97,696 rows × 19 columns loaded cleanly from the .rds file. Factor levels intact, ready to process.
+
+---
+
+## 3. Remove Duration Outliers
+
+Tracks exceeding 20 minutes (1,200,000 ms) are almost certainly misclassified content — podcasts, DJ sets, live concert recordings — that do not belong in a songs dataset. Including them would give those observations disproportionate leverage in regression.
+
+```{r remove-duration-outliers}
+out_dir <- "../outputs/eda"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+save_plot <- function(plot, filename, width = 7, height = 5, dpi = 72) {
+  path <- file.path(out_dir, filename)
+  ggsave(path, plot = plot, width = width, height = height, dpi = dpi)
+  cat("Saved:", path, "\n")
+}
+
+# Spotify color palette
+spotify_green <- "#1DB954"
+spotify_black <- "#121212"
+spotify_gray  <- "#535353"
+spotify_light <- "#F4F4F4"
+
+base_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14,
+                                    margin = margin(b = 8), color = spotify_black),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = spotify_light),
+    panel.grid.minor = element_blank(),
+    axis.title       = element_text(size = 11, color = spotify_gray),
+    axis.text        = element_text(color = spotify_gray),
+    strip.text       = element_text(face = "bold", color = spotify_black),
+    legend.text      = element_text(color = spotify_gray),
+    legend.title     = element_text(color = spotify_black)
+  )
+
+n_before <- nrow(df)
+df <- df |> filter(duration_ms <= 1200000)
+n_removed <- n_before - nrow(df)
+
+cat("Removing", n_removed, "tracks with duration > 20 min...\n")
+cat("Remaining rows:", nrow(df), "\n")
+```
+
+```{r plot-duration-clean}
+mean_dur_s <- mean(df$duration_ms) / 1000
+
+p8 <- ggplot(df, aes(x = duration_ms / 1000)) +
+  geom_histogram(
+    fill      = spotify_green,
+    color     = "white",
+    linewidth = 0.2,
+    bins      = 60
+  ) +
+  geom_vline(xintercept = mean_dur_s, color = spotify_black,
+             linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = mean_dur_s + 5, y = Inf, vjust = 1.5,
+           label = paste0("Mean = ", round(mean_dur_s, 0), "s"),
+           color = spotify_black, hjust = 0, size = 3.5) +
+  scale_x_continuous(labels = scales::label_number(suffix = "s")) +
+  labs(
+    title = "Track Duration After Outlier Removal",
+    x     = "Duration (seconds)",
+    y     = "Count"
+  ) +
+  base_theme
+
+p8
+save_plot(p8, "08_duration_clean.png")
+```
+
+---
+
+## 4. Drop Low-Utility Columns
+
+Two columns are dropped based on EDA findings:
+
+- **`time_signature`**: >90% of tracks are in 4/4 time — near-zero variance, no discriminating power.
+- **`key`**: 12 levels, no meaningful or consistent relationship with popularity observed in EDA.
+
+```{r drop-columns}
+df <- df |> select(-any_of(c("time_signature", "key")))
+
+cat("Remaining columns after dropping:\n")
+cat(paste(names(df), collapse = ", "), "\n")
+cat("Dimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+```
+
+Two columns are removed. *time_signature* exhibited near-zero variance — over 90% of tracks are in 4/4 time, leaving insufficient variation for any model to learn from. *key* had 12 levels but showed no discernible relationship with popularity in EDA. The dataset reduces from 19 to 17 columns.
+
+---
+
+## 5. Separate Metadata and Modeling Columns
+
+Before standardization, we explicitly separate columns into three groups — metadata, factor predictors, and numeric columns. This prevents accidental scaling of categorical variables or the target variable, and makes the modeling pipeline explicit and auditable.
+
+*Metadata columns are kept in the dataset for reference but will not enter any model.*
+
+```{r define-column-groups}
+metadata_cols <- c("artists", "album_name", "track_name")
+factor_cols   <- c("explicit", "mode", "track_genre")
+numeric_cols  <- c(
+  "popularity", "danceability", "energy", "loudness", "tempo",
+  "acousticness", "speechiness", "instrumentalness", "liveness",
+  "valence", "duration_ms"
+)
+
+# Summary table
+tibble(
+  group   = c("Metadata (not modeled)", "Factor predictors", "Numeric columns"),
+  columns = c(
+    paste(metadata_cols, collapse = ", "),
+    paste(factor_cols,   collapse = ", "),
+    paste(numeric_cols,  collapse = ", ")
+  ),
+  n = c(length(metadata_cols), length(factor_cols), length(numeric_cols))
+)
+```
+
+The dataset is cleanly partitioned into three groups: *3 metadata columns* that won't enter any model, *3 factor predictors* (explicit, mode, track_genre), and *11 numeric columns* including the target (popularity) and control variable (duration_ms). The 9 audio features that will be standardized and fed into PCA are all present.
+
+---
+
+## 6. Standardize Numeric Features
+
+PCA is sensitive to scale. A variable like tempo with values around 120 BPM would dominate a variable like danceability measured between 0 and 1 — not because it's more important, but simply because its numbers are larger. Standardizing to mean = 0, SD = 1 puts all nine features on equal footing before PCA runs.
+
+Note: *popularity and duration_ms are deliberately excluded from standardization*. popularity is our target variable and needs to stay on its original 1–100 scale for interpretability. duration_ms is a control variable we'll handle separately.
+
+```{r standardize}
+audio_features <- c(
+  "danceability", "energy", "loudness", "tempo",
+  "acousticness", "speechiness", "instrumentalness",
+  "liveness", "valence"
+)
+
+# Compute before-scaling stats for the verification table
+before_stats <- df |>
+  select(all_of(audio_features)) |>
+  summarise(across(everything(), list(mean = mean, sd = sd))) |>
+  pivot_longer(everything(),
+               names_to  = c("feature", ".value"),
+               names_sep = "_(?=[^_]+$)") |>
+  rename(mean_before = mean, sd_before = sd)
+
+# Apply scaling and save parameters for potential inverse-transform later
+scaling_params <- lapply(audio_features, function(feat) {
+  scaled <- scale(df[[feat]])
+  list(
+    center = attr(scaled, "scaled:center"),
+    scale  = attr(scaled, "scaled:scale")
+  )
+})
+names(scaling_params) <- audio_features
+
+saveRDS(scaling_params, "../data/scaling_params.rds")
+cat("Scaling parameters saved to ../data/scaling_params.rds\n")
+
+# Apply standardization to the dataframe
+df <- df |>
+  mutate(across(all_of(audio_features), ~ as.numeric(scale(.))))
+
+# Compute after-scaling stats
+after_stats <- df |>
+  select(all_of(audio_features)) |>
+  summarise(across(everything(), list(mean = mean, sd = sd))) |>
+  pivot_longer(everything(),
+               names_to  = c("feature", ".value"),
+               names_sep = "_(?=[^_]+$)") |>
+  rename(mean_after = mean, sd_after = sd)
+
+# Combined verification table
+before_stats |>
+  left_join(after_stats, by = "feature") |>
+  mutate(across(where(is.numeric), ~ round(., 4)))
+```
+
+Standardization confirmed across all 9 features — every mean_after is 0 and every sd_after is 1. The before columns show just how different the original scales were: tempo had a mean of 122.7 with SD of 30, while speechiness had a mean of 0.086 with SD of 0.11. Without standardization, PCA would have been completely dominated by tempo and loudness simply due to their larger numeric ranges.
+
+---
+
+## 7. Verify Standardization
+
+All nine features should now be centered at 0 with unit variance.
+
+```{r verify-standardization}
+df_std_long <- df |>
+  select(all_of(audio_features)) |>
+  pivot_longer(everything(), names_to = "feature", values_to = "value") |>
+  mutate(feature = str_to_title(feature))
+
+p9 <- ggplot(df_std_long, aes(x = value)) +
+  geom_histogram(
+    fill      = spotify_green,
+    color     = "white",
+    linewidth = 0.2,
+    bins      = 40
+  ) +
+  geom_vline(xintercept = 0, color = spotify_black,
+             linetype = "dashed", linewidth = 0.6) +
+  facet_wrap(~feature, scales = "free_y", ncol = 3) +
+  labs(
+    title = "Standardized Audio Features (mean = 0, SD = 1)",
+    x     = "Standardized Value",
+    y     = "Count"
+  ) +
+  base_theme +
+  theme(axis.text.x = element_text(size = 8))
+
+p9
+save_plot(p9, "09_standardized_features.png")
+```
+
+All 9 features are now centered at 0, confirmed by the dashed vertical line sitting at the peak of each distribution. The standardization worked correctly across the board.
+
+---
+
+## 8. Final Modeling Dataset
+
+We combine all three column groups — metadata, standardized audio features, and factor predictors — into a single modeling-ready dataset and save it. Every downstream notebook (PCA, regression, bootstrap) loads from this file. One clean source of truth for the entire modeling phase.
+
+```{r final-dataset}
+df_model <- df |>
+  select(
+    all_of(metadata_cols),   # artists, album_name, track_name
+    popularity,              # target variable
+    all_of(audio_features),  # 9 standardized audio features
+    duration_ms,             # control variable (unstandardized)
+    all_of(factor_cols)      # explicit, mode, track_genre
+  )
+
+cat("Final modeling dataset dimensions:", nrow(df_model), "rows x",
+    ncol(df_model), "columns\n\n")
+
+cat("Column names:\n")
+cat(paste(names(df_model), collapse = ", "), "\n\n")
+
+head(df_model, 5)
+```
+
+```{r save-model-dataset}
+saveRDS(df_model, "../data/spotify_model.rds")
+write_csv(df_model, "../data/spotify_model.csv")
+
+cat("Saved: ../data/spotify_model.rds\n")
+cat("Saved: ../data/spotify_model.csv\n")
+```
+
+The final modeling dataset is structured exactly as intended. Metadata columns are present but won't enter any model. popularity is on its original 1–100 scale. Audio features are standardized — visible in the negative values for Ben Woodward's "Ghost (Acoustic)", which scores well below average on energy and loudness, consistent with an acoustic track. Factor columns are intact.
+
+---
+
+*Next: `04_pca.Rmd` — Principal Component Analysis on the standardized audio features.*

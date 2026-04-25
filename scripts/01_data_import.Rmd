@@ -1,0 +1,232 @@
+---
+title: "Data Import & Cleaning — Spotify Tracks Dataset"
+subtitle: "MSDS 16:954:567 – Statistical Models and Computing"
+author: "Group 16 - Rohan Pant (rp1610) & Pranav Immaneni (pi83)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Overview
+
+Before any statistical analysis can begin, we need to understand what we are working with and ensure the data is in a state suitable for modeling. This notebook handles the first step of the project pipeline: importing the raw Spotify dataset, auditing its structure, resolving quality issues, and saving a clean version for downstream analysis.
+
+---
+
+## 1. Load Libraries
+
+We load three packages at the start of the pipeline. 
+
+**tidyverse** handles data import, manipulation, and reshaping. 
+
+**janitor** standardizes column names from the raw CSV into a consistent snake_case format. 
+
+```{r libraries}
+library(tidyverse)
+library(janitor)
+```
+
+---
+
+## 2. Import Data
+
+We load the raw CSV from the `data/` directory. If the file is not found, the script exits with an error.
+
+```{r import}
+raw_path <- "../data/spotify_tracks.csv"
+
+if (!file.exists(raw_path)) {
+  stop(
+    "Dataset not found at: ", raw_path, "\n",
+    "Place spotify_tracks.csv in the data/ folder and re-knit."
+  )
+}
+
+df_raw <- read_csv(raw_path, show_col_types = FALSE) |>
+  select(-any_of("...1"))  # drop unnamed row-index column if present
+
+cat("Raw dimensions:", nrow(df_raw), "rows x", ncol(df_raw), "columns\n")
+```
+
+The dataset contains approximately 114,000 tracks with 20 columns. This is the full raw extract from the Spotify API via Kaggle. 
+
+Note: The 20th column is the unnamed index artifact from the CSV — it gets dropped immediately, bringing us to the expected 19 informative columns.
+
+---
+
+## 3. Clean Column Names
+
+Raw CSVs from Kaggle often have inconsistent column names. **clean_names()** enforces snake_case across all headers in one call — no manual renaming needed.
+
+```{r clean-names}
+df <- df_raw |>
+  clean_names()
+
+cat("Cleaned column names:\n")
+cat(paste(names(df), collapse = ", "), "\n")
+```
+
+All 20 columns are now clean and consistently formatted. Nothing unexpected — the names match exactly what the Spotify API documentation describes.
+
+---
+
+## 4. Drop Irrelevant Columns
+
+Some columns exist purely as identifiers with no statistical meaning. Keeping them in the dataset would add noise to any distance-based or correlation computation.
+
+```{r drop-cols}
+cols_to_drop <- names(df) |>
+  keep(~ .x == "track_id" | str_detect(.x, "^x\\d*$"))
+
+if (length(cols_to_drop) > 0) {
+  cat("Dropping columns:", paste(cols_to_drop, collapse = ", "), "\n")
+  df <- df |> select(-all_of(cols_to_drop))
+} else {
+  cat("No index/id columns to drop.\n")
+}
+```
+
+Only `track_id` was dropped. No residual index columns were present — the CSV was cleaner than expected.
+
+---
+
+## 5. Missing Values
+
+Missing values in any column can silently distort correlations and regression estimates. We audit every column before proceeding and drop any incomplete rows.
+
+```{r missing-values}
+missing_counts <- df |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") |>
+  filter(n_missing > 0)
+
+if (nrow(missing_counts) == 0) {
+  cat("No missing values found. All columns are complete.\n")
+} else {
+  cat("Columns with missing values:\n")
+  print(missing_counts)
+  df <- df |> drop_na()
+  cat("Rows after dropping NAs:", nrow(df), "\n")
+}
+```
+
+Three columns had exactly 1 missing value each — artists, album_name, and track_name. All three are metadata fields, not predictors. One row was dropped, leaving 113,999 rows. Essentially a clean dataset.
+
+
+🎵 Fun fact: Out of 114,000 songs, exactly one track managed to exist without an artist name. Mystery artist, mystery song — gone.
+
+---
+
+## 6. Remove Duplicates
+
+Duplicate rows inflate sample size and bias correlation and regression estimates by over-representing certain tracks. We remove exact duplicates before any analysis.
+
+```{r duplicates}
+n_dupes <- sum(duplicated(df))
+
+if (n_dupes == 0) {
+  cat("No duplicate rows found.\n")
+} else {
+  cat("Removing", n_dupes, "duplicate row(s)...\n")
+  df <- df |> distinct()
+  cat("Rows after deduplication:", nrow(df), "\n")
+}
+```
+
+577 duplicate rows were removed, leaving 113,422 tracks. Not a trivial number — likely the same songs appearing across multiple genre categories in the original Kaggle scrape.
+
+🎵 Fun fact: 577 duplicates in a music dataset probably means some songs are genuinely so genre-defying that Spotify filed them under multiple categories and albums.
+
+---
+
+## 7. Convert Categorical Variables to Factors
+
+Several variables are stored as integers but represent discrete categories. Treating them as numeric in regression would impose a false ordering — as if key 11 is "more" than key 1 in some meaningful way. Converting to factors ensures R handles them correctly in all downstream operations.
+
+```{r factors}
+df <- df |>
+  mutate(
+    explicit       = factor(explicit, levels = c(FALSE, TRUE), labels = c("clean", "explicit")),
+    key            = factor(key),
+    mode           = factor(mode, levels = c(0, 1), labels = c("minor", "major")),
+    time_signature = factor(time_signature),
+    track_genre    = factor(track_genre)
+  )
+
+cat("Factor levels:\n")
+cat("  track_genre:", nlevels(df$track_genre), "genres\n")
+cat("  key:        ", nlevels(df$key), "pitch classes\n")
+cat("  mode:       ", nlevels(df$mode), "(minor / major)\n")
+cat("  time_sig:   ", nlevels(df$time_signature), "values\n")
+```
+
+114 genres, 12 pitch classes, 2 modes, 5 time signature values — all correctly encoded as factors. Nothing unexpected here.
+
+🎵 Fun fact: 5 time signature values sounds reasonable until you realize that one of them is probably 1/4 — which is either very experimental music or a data entry error. We'll find out in EDA.
+
+---
+
+## 8. Filter Zero-Popularity Tracks
+
+Tracks with popularity = 0 are not simply unpopular — they have never been streamed, are delisted, or were never publicly released. Including them would mix two fundamentally different phenomena: songs that were heard and didn't resonate, versus songs that were never encountered. Our research question is specifically about what makes an actively streamed song more or less popular, so we restrict to popularity > 0.
+
+```{r filter-popularity}
+n_before <- nrow(df)
+df <- df |> filter(popularity > 0)
+n_removed <- n_before - nrow(df)
+
+cat("Removed", n_removed, "zero-popularity rows.\n")
+cat("Remaining rows:", nrow(df), "\n")
+```
+
+*15,726 rows* removed — about *14%* of the dataset. Final working dataset: 97,696 tracks.
+
+🎵 Fun fact: Nearly 1 in 7 songs on Spotify has literally zero streams recorded. The music industry has always had more hopefuls than hits — turns out the data confirms it at scale.
+
+---
+
+## 9. Save Cleaned Data
+
+We save in two formats — .csv for readability and shareability, .rds to preserve factor levels exactly as encoded. All downstream notebooks load from the .rds to avoid re-specifying factor structure every time.
+
+```{r save}
+write_csv(df, "../data/spotify_cleaned.csv")
+saveRDS(df, "../data/spotify_cleaned.rds")
+
+cat("Saved: ../data/spotify_cleaned.csv\n")
+cat("Saved: ../data/spotify_cleaned.rds\n")
+```
+
+---
+
+## 10. Final Dataset Summary
+
+A final sanity check before saving. We confirm the dimensions are what we expect, the popularity range is valid, and the first few rows look structurally correct.
+
+```{r summary}
+cat("Final dimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+cat("Popularity range: [", min(df$popularity), ",", max(df$popularity), "]\n\n")
+
+head(df)
+```
+
+97,696 rows × 19 columns. Popularity ranges from 1 to 100 — exactly what we want after removing the zeros. 
+
+The head() preview confirms factor encoding is intact and all columns are present.
+
+---
+
+*Next: `02_eda.Rmd` — Exploratory Data Analysis*

@@ -1,0 +1,424 @@
+---
+title: "Exploratory Data Analysis — Spotify Tracks Dataset"
+subtitle: "MSDS 16:954:567 – Statistical Models and Computing"
+author: "Group 16 - Rohan Pant (rp1610) & Pranav Immaneni (pi83)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 7,
+  fig.height = 5,
+  dpi        = 72
+)
+```
+
+## Overview
+
+With a clean dataset in hand, the next question is: *what does it actually look like?* Before fitting any model, we need to understand the distributions of our variables, identify relationships between features, and spot any structural patterns or anomalies that should inform our modeling choices.
+
+This notebook serves three purposes:
+
+1. **Understand the target variable** — How is popularity distributed? Is it well-behaved enough for linear regression, or will it need transformation?
+2. **Understand the predictors** — Are the audio features normally distributed? Are any zero-inflated, skewed, or nearly constant?
+3. **Identify relationships** — Which features correlate with popularity? Which features correlate with *each other*? The answers will directly motivate our choice of PCA and regression strategy.
+
+All plots are saved to `outputs/eda/` for inclusion in the project report.
+
+---
+
+## 1. Load Libraries
+
+Same core packages as the import notebook, with one addition: ggcorrplot for the data vizualizations.
+
+```{r libraries}
+library(tidyverse)
+library(ggcorrplot)
+```
+
+---
+
+## 2. Load Data
+
+We load from the .rds file — not the CSV — to ensure factor levels are preserved exactly as encoded in the cleaning step. 
+
+```{r load-data}
+out_dir <- "../outputs/eda"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+df <- readRDS("../data/spotify_cleaned.rds")
+cat("Loaded:", nrow(df), "rows x", ncol(df), "columns\n")
+```
+
+```{r helpers, include=FALSE}
+save_plot <- function(plot, filename, width = 7, height = 5, dpi = 72) {
+  path <- file.path(out_dir, filename)
+  ggsave(path, plot = plot, width = width, height = height, dpi = dpi)
+  cat("Saved:", path, "\n")
+}
+
+# Spotify color palette
+spotify_green <- "#1DB954"
+spotify_black <- "#121212"
+spotify_gray  <- "#535353"
+spotify_light <- "#F4F4F4"
+
+base_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14,
+                                    margin = margin(b = 8), color = spotify_black),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = spotify_light),
+    panel.grid.minor = element_blank(),
+    axis.title       = element_text(size = 11, color = spotify_gray),
+    axis.text        = element_text(color = spotify_gray),
+    strip.text       = element_text(face = "bold", color = spotify_black),
+    legend.text      = element_text(color = spotify_gray),
+    legend.title     = element_text(color = spotify_black)
+  )
+```
+
+We are working with `r nrow(df)` tracks and `r ncol(df)` variables. The target variable is `popularity` — a continuous score from 1 to 100 assigned by Spotify based on recent streaming activity.
+
+---
+
+## 3. Popularity Distribution
+
+The first thing we need to understand is our target variable. If popularity were uniformly distributed, prediction would be relatively straightforward. If it is heavily skewed or multimodal, that changes our modeling strategy.
+
+```{r popularity-distribution}
+pop_mean <- mean(df$popularity)
+
+p1 <- ggplot(df, aes(x = popularity)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    binwidth   = 2,
+    fill       = spotify_green,
+    color      = "white",
+    linewidth  = 0.2
+  ) +
+  geom_density(color = spotify_black, linewidth = 0.8, adjust = 1.5) +
+  geom_vline(xintercept = pop_mean, color = spotify_black,
+             linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = pop_mean + 2.5, y = 0.025,
+           label = paste0("Mean = ", round(pop_mean, 1)),
+           color = spotify_black, hjust = 0, size = 3.5) +
+  labs(
+    title = "Distribution of Track Popularity",
+    x     = "Popularity",
+    y     = "Density"
+  ) +
+  base_theme
+
+p1
+save_plot(p1, "01_popularity_distribution.png")
+```
+
+**What this tells us:** Popularity is clearly right-skewed. The bulk of tracks sit in the 20–60 range, with a long but thin tail stretching toward 100. Very few songs achieve top-tier popularity — which aligns with how the music industry actually works. The mean (~39) sits noticeably to the right of the modal region, confirming the skew.
+
+This has a direct implication for our regression model: OLS assumes normally distributed residuals, and a skewed outcome can violate this. We will check residual diagnostics carefully, and may apply a square-root or log transformation of popularity if needed. For now, we proceed with the raw scale and revisit this in the modeling notebook.
+
+---
+
+## 4. Audio Feature Distributions
+
+Now we examine the nine core audio features. Understanding their distributions tells us which variables are well-behaved and which will need special attention in regression and PCA.
+
+```{r audio-feature-distributions}
+audio_features <- c(
+  "danceability", "energy", "loudness", "tempo",
+  "acousticness", "speechiness", "instrumentalness",
+  "liveness", "valence"
+)
+
+df_long <- df |>
+  select(all_of(audio_features)) |>
+  pivot_longer(everything(), names_to = "feature", values_to = "value") |>
+  mutate(feature = str_to_title(feature))
+
+p2 <- ggplot(df_long, aes(x = value)) +
+  geom_histogram(
+    fill      = spotify_green,
+    color     = "white",
+    linewidth = 0.2,
+    bins      = 40
+  ) +
+  facet_wrap(~feature, scales = "free_x", ncol = 3) +
+  labs(
+    title = "Distribution of Audio Features",
+    x     = NULL,
+    y     = "Count"
+  ) +
+  base_theme +
+  theme(axis.text.x = element_text(size = 8))
+
+p2
+save_plot(p2, "02_audio_feature_distributions.png")
+```
+
+**What this tells us:** The nine features fall into three behavioral groups, each with different implications for modeling:
+
+- **Well-behaved (roughly normal):** `danceability`, `energy`, `tempo`, `valence`, `loudness`. These can enter regression directly without transformation.
+
+- **Zero-inflated:** `speechiness` and `instrumentalness` both have extreme concentrations near zero, with sparse long tails. Most tracks are neither primarily spoken-word nor purely instrumental. In regression, these variables will have skewed residual contributions — we will monitor their VIF and consider whether log-transformation or exclusion is warranted.
+
+- **Bimodal / boundary-heavy:** `acousticness` shows a U-shaped distribution — tracks tend to be either strongly acoustic or clearly not acoustic, with few in between. `liveness` is similarly right-skewed, with most tracks being studio recordings. These bimodal patterns are substantively meaningful: they suggest that the dataset contains structurally distinct subpopulations (acoustic vs. electronic, studio vs. live), which PCA may naturally separate into distinct components.
+
+---
+
+## 5. Correlation Matrix
+
+A critical step before any regression or PCA is understanding how the features relate to *each other*. If predictors are highly correlated, including them all in a regression model simultaneously will inflate standard errors and make coefficients unreliable — a problem known as multicollinearity.
+
+```{r correlation-matrix}
+numeric_cols <- c("popularity", audio_features, "duration_ms")
+
+cor_matrix <- df |>
+  select(all_of(numeric_cols)) |>
+  cor(use = "complete.obs")
+
+p3 <- ggcorrplot(
+  cor_matrix,
+  method      = "square",
+  type        = "lower",
+  lab         = TRUE,
+  lab_size    = 3,
+  colors      = c("#B22222", "white", "#1DB954"),
+  outline.col = "white",
+  tl.cex      = 10
+) +
+  labs(title = "Correlation Matrix of Audio Features and Popularity") +
+  base_theme +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 9)
+  )
+
+p3
+save_plot(p3, "03_correlation_matrix.png")
+```
+
+**What this tells us:** Three pairs of features exhibit strong correlations (|r| > 0.5):
+
+- `energy` ↔ `loudness`: **r ≈ +0.76** — the loudest tracks tend to be the most energetic. These two features are capturing much of the same underlying signal.
+- `energy` ↔ `acousticness`: **r ≈ −0.72** — acoustic tracks are consistently lower energy. This makes intuitive sense: a quiet acoustic guitar recording and a high-energy EDM track occupy opposite ends of both dimensions.
+- `loudness` ↔ `acousticness`: **r ≈ −0.58** — following from the above, acoustic tracks are also quieter on average.
+
+This multicollinearity cluster among `energy`, `loudness`, and `acousticness` is exactly why we need **PCA**. Rather than including these three correlated features as separate predictors in regression — where their coefficients would be unstable and hard to interpret — PCA will collapse them into a single orthogonal component that captures their shared variance cleanly. This is not a workaround; it is the statistically correct approach.
+
+As for popularity — its entire row is nearly white. No single feature correlates strongly with it. The strongest is instrumentalness at −0.18, and everything else is below 0.10. We'll dig into this in the next section.
+
+---
+
+## 6. Key Features vs Popularity
+
+We have seen how the features relate to each other. Now we ask the key question: do any of these features show a meaningful relationship with popularity individually?
+
+```{r features-vs-popularity}
+set.seed(42)
+df_sample <- df |> slice_sample(n = 5000)
+
+scatter_features <- c("danceability", "energy", "loudness", "acousticness")
+
+df_scatter <- df_sample |>
+  select(popularity, all_of(scatter_features)) |>
+  pivot_longer(-popularity, names_to = "feature", values_to = "value") |>
+  mutate(feature = str_to_title(feature))
+
+p4 <- ggplot(df_scatter, aes(x = value, y = popularity)) +
+  geom_point(alpha = 0.1, size = 0.8, color = spotify_green) +
+  geom_smooth(method = "loess", color = spotify_black, linewidth = 0.9,
+              se = TRUE, formula = y ~ x) +
+  facet_wrap(~feature, scales = "free_x", ncol = 2) +
+  labs(
+    title = "Key Audio Features vs Popularity",
+    x     = "Feature Value",
+    y     = "Popularity"
+  ) +
+  base_theme
+
+p4
+save_plot(p4, "04_features_vs_popularity.png")
+```
+
+**What this tells us:** The LOESS smooth curves are nearly flat across all four features. There is no strong individual linear relationship between any single audio feature and popularity. The scatter is wide, and the trend lines — while showing slight curvature in some panels — explain very little of the variation.
+
+This might seem discouraging, but it is actually one of the most important findings of the EDA. **It tells us that popularity is not simply a function of any one sonic characteristic.** A song does not become popular just by being louder, more energetic, more danceable, or less acoustic. This flat relationship motivates the multivariate approach: only by modeling combinations of features simultaneously (through regression) and identifying latent structure (through PCA) can we hope to explain meaningful variation in popularity.
+
+---
+
+## 7. Categorical Features vs Popularity
+
+Beyond the continuous audio features, we have several categorical variables. Do explicit content, musical mode, or other categorical attributes differentiate popular from unpopular tracks?
+
+### 7a. Explicit Content
+
+```{r popularity-by-explicit}
+p5a <- ggplot(df, aes(x = explicit, y = popularity, fill = explicit)) +
+  geom_boxplot(outlier.alpha = 0.05, outlier.size = 0.5, width = 0.5) +
+  scale_fill_manual(values = c("clean" = spotify_gray, "explicit" = spotify_green)) +
+  labs(
+    title = "Popularity by Explicit Content",
+    x     = "Content Type",
+    y     = "Popularity"
+  ) +
+  base_theme +
+  theme(legend.position = "none")
+
+p5a
+save_plot(p5a, "05a_popularity_by_explicit.png")
+```
+
+**What this tells us:** Explicit tracks have a visibly higher median popularity than clean tracks. However, we should be careful not to interpret this causally. The dataset contains 114 genres, and genres like hip-hop and rap — which skew toward explicit content — also tend to have high popularity scores. This is a classic case of **confounding**: the apparent effect of explicit content may largely be a genre effect in disguise. Our regression model, which will control for genre, will help disentangle this.
+
+### 7b. Mode (Major vs Minor)
+
+```{r popularity-by-mode}
+p5b <- df |>
+  mutate(mode = fct_recode(mode, "Major" = "major", "Minor" = "minor")) |>
+  ggplot(aes(x = mode, y = popularity, fill = mode)) +
+  geom_boxplot(outlier.alpha = 0.05, outlier.size = 0.5, width = 0.5) +
+  scale_fill_manual(values = c("Major" = spotify_green, "Minor" = spotify_gray)) +
+  labs(
+    title = "Popularity by Mode (Major vs Minor)",
+    x     = "Mode",
+    y     = "Popularity"
+  ) +
+  base_theme +
+  theme(legend.position = "none")
+
+p5b
+save_plot(p5b, "05b_popularity_by_mode.png")
+```
+
+**What this tells us:** The distributions of popularity for major and minor key tracks are nearly identical. Musical mode — whether a song is in a major or minor key — does not appear to meaningfully differentiate popular from unpopular tracks at this level of analysis. This negative finding is still informative: it tells us that mode is unlikely to be a useful predictor in our regression model, and we will not overfit by including it. We include it in the initial model for completeness, but do not expect a significant coefficient.
+
+---
+
+## 8. Genre Analysis
+
+Genre is the categorical variable we expect to have the strongest relationship with popularity. Unlike continuous audio features, which show weak individual correlations with the target, genre encodes a rich combination of musical style, audience size, platform curation, and cultural moment.
+
+```{r genre-popularity}
+genre_means <- df |>
+  group_by(track_genre) |>
+  summarise(mean_popularity = mean(popularity), .groups = "drop") |>
+  arrange(desc(mean_popularity))
+
+# Top 20 and bottom 20
+genre_top20    <- genre_means |> slice(1:20)
+genre_bottom20 <- genre_means |> slice((n()-19):n())
+
+genre_plot_data <- bind_rows(
+  genre_top20    |> mutate(group = "Top 20"),
+  genre_bottom20 |> mutate(group = "Bottom 20")
+) |>
+  mutate(track_genre = fct_inorder(track_genre))
+
+p6 <- ggplot(genre_plot_data, aes(x = mean_popularity, y = track_genre,
+                                   fill = mean_popularity)) +
+  geom_col() +
+  scale_fill_gradient(low = spotify_gray, high = spotify_green) +
+  facet_wrap(~group, scales = "free_y", ncol = 1) +
+  labs(
+    title    = "Mean Popularity by Genre — Top 20 and Bottom 20",
+    x        = "Mean Popularity",
+    y        = NULL,
+    fill     = "Mean\nPopularity"
+  ) +
+  base_theme +
+  theme(
+    axis.text.y     = element_text(size = 9),
+    legend.position = "right",
+    strip.text      = element_text(size = 11)
+  )
+
+p6
+save_plot(p6, "06_mean_popularity_by_genre.png")
+```
+
+**What this tells us:** Mean popularity varies substantially across the 114 genre categories — far more than any individual audio feature.The *top 20* is led by pop-film and k-pop at close to 60 mean popularity, followed by electro, house, edm, and chill. The pattern is clear — contemporary, streaming-native genres dominate. These are genres built for the playlist era.
+
+The *bottom 20* tells an equally clear story. Study, heavy-metal, bluegrass, afrobeat, and classical sit below 20 mean popularity. These are either niche genres with small but dedicated audiences, or genres whose listeners don't engage with Spotify's mainstream discovery ecosystem the same way.
+
+The gap between *pop-film (~58)* and *study (~10)* is nearly *50 points* — wider than any audio feature effect we've seen. This single plot is the strongest argument in our entire EDA for why genre must be in the regression model.
+
+Note that because the dataset is well-balanced (~999 tracks per genre), these mean estimates are reliable and not driven by sample size differences.
+
+---
+
+## 9. Duration Outlier Check
+
+Track duration is a control variable in our model rather than a primary predictor of interest. However, before including it, we need to check whether extreme outliers could distort our regression estimates.
+
+```{r duration-outliers}
+n_extreme <- sum(df$duration_ms > 1200000)
+cat("Tracks > 20 min (extreme outliers):", n_extreme, "\n")
+
+p7 <- ggplot(df, aes(y = duration_ms)) +
+  geom_boxplot(fill = spotify_green, outlier.alpha = 0.15, outlier.size = 0.6,
+               width = 0.4) +
+  scale_y_continuous(
+    labels = scales::label_number(scale = 1e-3, suffix = "k ms"),
+    breaks = seq(0, max(df$duration_ms), by = 500000)
+  ) +
+  labs(
+    title = "Track Duration Distribution (with outliers)",
+    y     = "Duration (ms)",
+    x     = NULL
+  ) +
+  base_theme +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+p7
+save_plot(p7, "07_duration_outliers.png")
+```
+
+**What this tells us:** There are `r n_extreme` tracks exceeding 20 minutes in duration. These are almost certainly misclassified content — podcasts, DJ mixes, live concert recordings, or medleys — that ended up in a tracks dataset. Including them in regression would give excessive leverage to a handful of observations that are not representative of the songs we are trying to model. These will be filtered out in the feature engineering step before modeling begins. The vast majority of tracks have a duration between 2 and 6 minutes, which is the expected range for commercial music.
+
+---
+
+## 10. Correlation with Popularity
+
+We close the EDA with a ranked summary of every numeric feature's individual correlation with the target variable. This table directly informs our expectations going into the regression modeling phase.
+
+```{r correlation-summary}
+cor_with_popularity <- cor_matrix["popularity", ] |>
+  as_tibble(rownames = "feature") |>
+  rename(correlation = value) |>
+  filter(feature != "popularity") |>
+  arrange(desc(abs(correlation)))
+
+knitr::kable(
+  cor_with_popularity,
+  digits  = 3,
+  caption = "Correlation of each numeric feature with popularity (sorted by |r|)"
+)
+
+write_csv(cor_with_popularity,
+          file.path(out_dir, "correlation_with_popularity.csv"))
+cat("Saved: outputs/eda/correlation_with_popularity.csv\n")
+```
+
+**What this tells us:** The most striking aspect of this table is not which feature ranks highest — it is how *weak* all the correlations are. The strongest individual predictor, `instrumentalness`, has a correlation of just −0.18 with popularity. Everything else is below 0.10 in absolute value. In a naive analysis, one might conclude that audio features simply do not predict popularity. But this interpretation misses a crucial point.
+
+Linear correlation measures only pairwise, linear relationships. It cannot detect:
+
+- **Interactions** — perhaps the combination of high danceability *and* low instrumentalness predicts popularity, even if neither does alone.
+- **Non-linear effects** — the LOESS plots in Section 6 hint at some curvature.
+- **Latent structure** — PCA will reveal whether groups of features jointly explain popularity better than any single feature.
+
+The weak individual correlations are not a failure of the data. They are the reason this project requires PCA and multivariate regression rather than a simple bivariate analysis. The analysis is in the combinations, not the individual features.
+
+---
+
+*Next: `03_feature_engineering.Rmd` — Outlier removal, standardization, and preparation for PCA and regression.*

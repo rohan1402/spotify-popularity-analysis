@@ -1,0 +1,354 @@
+---
+title: "Principal Component Analysis — Spotify Audio Features"
+subtitle: "MSDS 16:954:567 – Statistical Models and Computing"
+author: "Rutgers University"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_knit$set(root.dir = "..")
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 7,
+  fig.height = 5,
+  dpi        = 72
+)
+```
+
+## Overview
+
+The EDA revealed a problem that prevents us from simply running a multiple regression on all nine audio features: **multicollinearity**. Three pairs of features are strongly correlated — `energy`/`loudness` (r ≈ +0.76), `energy`/`acousticness` (r ≈ −0.72), and `loudness`/`acousticness` (r ≈ −0.58). Including all three as separate predictors inflates standard errors and makes regression coefficients unstable and hard to interpret.
+
+**Principal Component Analysis (PCA)** resolves this by rotating the nine features into a new set of orthogonal (uncorrelated) axes — the principal components — that capture the same variance more efficiently. We then use these components, rather than the raw features, as predictors in the regression model.
+
+> **Business framing:** From a music industry perspective, PCA answers: *"Are there underlying sonic dimensions that group audio features together?"* If we find, for instance, that danceability, energy, and loudness all load onto the same component, that component represents a single underlying quality — call it "intensity" — that a label can use as a single lever when evaluating a track's commercial profile.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(factoextra)  # PCA visualization: scree plots, biplots, loadings
+```
+
+---
+
+## 2. Load Data
+
+```{r load-data}
+out_dir <- "../outputs/pca"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+df <- readRDS("../data/spotify_model.rds")
+cat("Loaded:", nrow(df), "rows x", ncol(df), "columns\n")
+```
+
+```{r helpers, include=FALSE}
+save_plot <- function(plot, filename, width = 7, height = 5, dpi = 72) {
+  path <- file.path(out_dir, filename)
+  ggsave(path, plot = plot, width = width, height = height, dpi = dpi)
+  cat("Saved:", path, "\n")
+}
+
+# Spotify color palette
+spotify_green <- "#1DB954"
+spotify_black <- "#121212"
+spotify_gray  <- "#535353"
+spotify_light <- "#F4F4F4"
+
+base_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14,
+                                    margin = margin(b = 8), color = spotify_black),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = spotify_light),
+    panel.grid.minor = element_blank(),
+    axis.title       = element_text(size = 11, color = spotify_gray),
+    axis.text        = element_text(color = spotify_gray),
+    strip.text       = element_text(face = "bold", color = spotify_black),
+    legend.text      = element_text(color = spotify_gray),
+    legend.title     = element_text(color = spotify_black)
+  )
+```
+
+---
+
+## 3. Run PCA
+
+The nine audio features were already standardized (mean = 0, SD = 1) in `03_feature_engineering.Rmd`, so we set `scale. = FALSE` — no re-scaling needed.
+
+```{r run-pca}
+audio_features <- c(
+  "danceability", "energy", "loudness", "tempo",
+  "acousticness", "speechiness", "instrumentalness",
+  "liveness", "valence"
+)
+
+pca_input <- df |> select(all_of(audio_features))
+
+pca_result <- prcomp(pca_input, center = FALSE, scale. = FALSE)
+
+# Variance explained by each component
+var_explained <- summary(pca_result)$importance
+cat("Variance explained by each component:\n")
+print(round(var_explained, 4))
+```
+
+---
+
+## 4. Scree Plot — How Many Components to Retain?
+
+We use two criteria to decide how many principal components to keep:
+
+- **Kaiser criterion**: retain components with eigenvalue > 1 (i.e., they explain more variance than a single original variable)
+- **Elbow rule**: retain components up to the point where the scree plot bends
+
+```{r scree-plot}
+# Eigenvalues = variance of each component (since features are standardized)
+eigenvalues <- pca_result$sdev^2
+n_comp      <- length(eigenvalues)
+
+scree_df <- tibble(
+  component    = 1:n_comp,
+  eigenvalue   = eigenvalues,
+  pct_var      = eigenvalues / sum(eigenvalues) * 100,
+  cum_pct_var  = cumsum(pct_var)
+)
+
+cat("Eigenvalues and variance explained:\n")
+print(scree_df |> mutate(across(where(is.numeric), ~ round(., 3))))
+
+# Components with eigenvalue > 1 (Kaiser criterion)
+n_kaiser <- sum(eigenvalues > 1)
+cat("\nComponents with eigenvalue > 1 (Kaiser criterion):", n_kaiser, "\n")
+
+# Scree plot
+p_scree <- ggplot(scree_df, aes(x = component, y = eigenvalue)) +
+  geom_col(fill = spotify_green, width = 0.6) +
+  geom_line(color = spotify_black, linewidth = 0.8) +
+  geom_point(color = spotify_black, size = 3) +
+  geom_hline(yintercept = 1, linetype = "dashed",
+             color = "firebrick", linewidth = 0.7) +
+  annotate("text", x = n_comp - 0.5, y = 1.08,
+           label = "Eigenvalue = 1", color = "firebrick", size = 3.2, hjust = 1) +
+  scale_x_continuous(breaks = 1:n_comp) +
+  labs(
+    title = "Scree Plot — Eigenvalues by Principal Component",
+    x     = "Principal Component",
+    y     = "Eigenvalue"
+  ) +
+  base_theme
+
+p_scree
+save_plot(p_scree, "01_scree_plot.png")
+```
+
+```{r cumvar-plot}
+# Cumulative variance plot
+p_cumvar <- ggplot(scree_df, aes(x = component, y = cum_pct_var)) +
+  geom_col(fill = spotify_green, alpha = 0.4, width = 0.6) +
+  geom_line(color = spotify_black, linewidth = 0.8) +
+  geom_point(color = spotify_black, size = 3) +
+  geom_hline(yintercept = 80, linetype = "dashed",
+             color = "firebrick", linewidth = 0.7) +
+  annotate("text", x = n_comp - 0.5, y = 81.5,
+           label = "80% threshold", color = "firebrick", size = 3.2, hjust = 1) +
+  scale_x_continuous(breaks = 1:n_comp) +
+  scale_y_continuous(labels = scales::label_number(suffix = "%"), limits = c(0, 105)) +
+  labs(
+    title = "Cumulative Variance Explained by Principal Components",
+    x     = "Number of Components",
+    y     = "Cumulative Variance Explained"
+  ) +
+  base_theme
+
+p_cumvar
+save_plot(p_cumvar, "02_cumulative_variance.png")
+```
+
+---
+
+## 5. Component Loadings
+
+Loadings tell us how much each original audio feature contributes to each principal component. Large absolute loadings (positive or negative) indicate that a feature drives that component strongly.
+
+```{r loadings-table}
+loadings_df <- pca_result$rotation |>
+  as.data.frame() |>
+  rownames_to_column("feature") |>
+  as_tibble()
+
+loadings_df |> mutate(across(where(is.numeric), ~ round(., 3)))
+```
+
+```{r loadings-heatmap}
+# Retain only components with eigenvalue > 1 for the heatmap
+pc_cols <- paste0("PC", 1:n_kaiser)
+
+loadings_long <- loadings_df |>
+  select(feature, all_of(pc_cols)) |>
+  pivot_longer(-feature, names_to = "component", values_to = "loading") |>
+  mutate(feature = str_to_title(feature))
+
+p_loadings <- ggplot(loadings_long,
+                     aes(x = component, y = feature, fill = loading)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(loading, 2)),
+            size = 3.2, color = spotify_black) +
+  scale_fill_gradient2(
+    low      = "#B22222",
+    mid      = "white",
+    high     = spotify_green,
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Loading"
+  ) +
+  labs(
+    title = "PCA Loadings Heatmap",
+    x     = "Principal Component",
+    y     = NULL
+  ) +
+  base_theme +
+  theme(
+    axis.text.y  = element_text(size = 10),
+    panel.grid   = element_blank()
+  )
+
+p_loadings
+save_plot(p_loadings, "03_loadings_heatmap.png")
+```
+
+---
+
+## 6. Biplot — PC1 vs PC2
+
+The biplot shows both the observations (tracks) and the original feature vectors projected onto the first two principal components. Features pointing in the same direction are positively correlated; features pointing in opposite directions are negatively correlated.
+
+```{r biplot}
+# Sample 2,000 points for readability
+set.seed(42)
+sample_idx <- sample(nrow(pca_input), 2000)
+
+p_biplot <- fviz_pca_biplot(
+  pca_result,
+  ind.ind    = sample_idx,
+  geom.ind   = "point",
+  col.ind    = spotify_gray,
+  alpha.ind  = 0.3,
+  col.var    = spotify_green,
+  repel      = TRUE,
+  label      = "var"
+) +
+  labs(title = "PCA Biplot — PC1 vs PC2 (sample of 2,000 tracks)") +
+  base_theme
+
+p_biplot
+save_plot(p_biplot, "04_biplot.png")
+```
+
+---
+
+## 7. Interpret and Name the Retained Components
+
+Based on the loadings heatmap, we can assign intuitive names to each retained component. These names will be used in the regression model for interpretability.
+
+```{r interpret-components}
+# Print top loadings per retained component for interpretation
+cat("Top loadings per retained component:\n\n")
+
+for (pc in pc_cols) {
+  top <- loadings_df |>
+    select(feature, all_of(pc)) |>
+    rename(loading = 2) |>
+    arrange(desc(abs(loading))) |>
+    head(4)
+  cat(pc, "— top features:\n")
+  print(top)
+  cat("\n")
+}
+```
+
+> **Component interpretation — based on actual loadings:**
+>
+> - **PC1 — "Acoustic vs. Electronic Intensity"** (31.1% of variance)
+>   Dominated by `loudness` (−0.52), `energy` (−0.52), and `acousticness` (+0.44). A high PC1 score signals a quiet, acoustic, low-energy track. A low PC1 score signals a loud, high-energy, electronic track. This is the single largest source of variation in the dataset — the fundamental divide between acoustic and electronic music.
+>
+> - **PC2 — "Danceability & Positive Valence"** (16.1% of variance)
+>   Driven by `danceability` (+0.59) and `valence` (+0.54). Tracks scoring high on PC2 are upbeat, happy, and rhythmically engaging. Tracks scoring low tend to be more instrumental, slower, and emotionally neutral or negative. This component captures the mood and rhythmic feel of a track.
+>
+> - **PC3 — "Liveness & Speechiness"** (13.8% of variance)
+>   Driven almost entirely by `liveness` (+0.69) and `speechiness` (+0.63). High scores indicate live recordings, podcasts, or tracks with heavy spoken-word content. This component is largely a noise/content-type filter — tracks scoring high here are less likely to be conventional studio songs.
+>
+> **Note on component retention:** The Kaiser criterion (eigenvalue > 1) retains 3 components, explaining 61% of variance. The 80% threshold would require 5 components. For the regression model we retain 3 (Kaiser), but we note that PC4 and PC5 together add another 20% of explained variance — if regression diagnostics suggest underfitting, we will revisit this decision.
+>
+> **Business framing:** These three dimensions give a music label a compact profile of any track. PC1 tells you whether a track is acoustic or electronic. PC2 tells you whether it is happy and danceable. PC3 flags whether it sounds live or contains spoken content. A label evaluating a new artist can immediately map their sound onto these axes — and the regression model in the next notebook will quantify exactly how much each axis predicts commercial popularity on Spotify.
+
+---
+
+## 8. Append PC Scores to Modeling Dataset
+
+We add the retained PC scores to the modeling dataset as new columns. These will be used alongside `duration_ms`, `explicit`, `mode`, and `track_genre` in the regression model.
+
+```{r append-scores}
+# Extract PC scores for all retained components
+pc_scores <- pca_result$x[, 1:n_kaiser] |>
+  as_tibble() |>
+  setNames(paste0("pc", 1:n_kaiser))
+
+df_pca <- bind_cols(df, pc_scores)
+
+cat("Dataset with PC scores:\n")
+cat("Dimensions:", nrow(df_pca), "x", ncol(df_pca), "\n")
+cat("New columns added:", paste(paste0("pc", 1:n_kaiser), collapse = ", "), "\n")
+```
+
+```{r correlation-pcs-popularity}
+# Check correlation of each PC with popularity
+cor_pcs <- df_pca |>
+  select(popularity, starts_with("pc")) |>
+  cor() |>
+  as.data.frame() |>
+  rownames_to_column("variable") |>
+  filter(variable == "popularity") |>
+  select(-variable, -popularity) |>
+  pivot_longer(everything(),
+               names_to  = "component",
+               values_to = "correlation_with_popularity") |>
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+cat("\nCorrelation of each PC with popularity:\n")
+print(cor_pcs)
+```
+
+**What this tells us:** None of the three retained components correlates strongly with popularity. PC1 (Acoustic vs. Electronic) has r = −0.04, PC2 (Danceability & Valence) has r = +0.08, and PC3 (Liveness & Speechiness) has r = −0.06. Even the strongest correlation across all nine components is r = 0.13 (PC5). This confirms the core EDA finding: **no single sonic dimension, on its own, drives popularity**.
+
+This does not make PCA useless for regression — it makes it *necessary*. By entering the components as orthogonal predictors, we eliminate multicollinearity and allow the regression model to estimate the joint effect of all dimensions simultaneously. The signal may be weak in any one component but could be meaningful in combination, especially once genre, mode, and explicit content are controlled for.
+
+> **Business framing:** The weak individual correlations mean a label cannot rely on a single sonic rule (e.g. "make it more danceable") to guarantee a hit. Popularity on Spotify is a complex outcome driven by a combination of audio characteristics, genre context, and platform curation — all of which the regression model will attempt to disentangle.
+
+---
+
+## 9. Save Output
+
+```{r save}
+saveRDS(df_pca,      "../data/spotify_pca.rds")
+saveRDS(pca_result,  "../data/pca_result.rds")
+
+cat("Saved: ../data/spotify_pca.rds\n")
+cat("Saved: ../data/pca_result.rds\n")
+cat("\nPCA complete. Retained", n_kaiser, "components.\n")
+```
+
+---
+
+*Next: `05_regression.Rmd` — Multiple linear regression using PC scores + control variables to predict popularity.*

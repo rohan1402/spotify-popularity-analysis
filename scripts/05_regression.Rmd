@@ -1,0 +1,448 @@
+---
+title: "Multiple Linear Regression — Predicting Spotify Popularity"
+subtitle: "MSDS 16:954:567 – Statistical Models and Computing"
+author: "Rutgers University"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_knit$set(root.dir = "..")
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 7,
+  fig.height = 5,
+  dpi        = 72
+)
+```
+
+## Overview
+
+This notebook fits multiple linear regression models to predict track popularity using the principal components derived in `04_pca.Rmd`, along with control variables (`duration_ms`, `explicit`, `mode`) and genre fixed effects (`track_genre`).
+
+We fit two models to isolate the contribution of genre:
+
+- **Model 1 (Audio-only):** `popularity ~ pc1 + pc2 + pc3 + duration_ms + explicit + mode`
+- **Model 2 (Full model):** `popularity ~ pc1 + pc2 + pc3 + duration_ms + explicit + mode + track_genre`
+
+Comparing these models directly quantifies how much of popularity is explained by sonic characteristics alone versus genre context — a question with direct practical implications for music label strategy.
+
+> **Business framing:** The key question for a label or streaming platform is: *"Can we predict a song's popularity from how it sounds?"* If audio features explain popularity well, labels can use sonic profiling to identify hits before release. If genre dominates, the implication is different — success depends more on market positioning and genre audience size than on the track's actual sound.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(broom)      # tidy model summaries
+```
+
+---
+
+## 2. Load Data
+
+```{r load-data}
+out_dir <- "../outputs/regression"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+df <- readRDS("../data/spotify_pca.rds")
+cat("Loaded:", nrow(df), "rows x", ncol(df), "columns\n")
+```
+
+```{r helpers, include=FALSE}
+save_plot <- function(plot, filename, width = 7, height = 5, dpi = 72) {
+  path <- file.path(out_dir, filename)
+  ggsave(path, plot = plot, width = width, height = height, dpi = dpi)
+  cat("Saved:", path, "\n")
+}
+
+# Spotify color palette
+spotify_green <- "#1DB954"
+spotify_black <- "#121212"
+spotify_gray  <- "#535353"
+spotify_light <- "#F4F4F4"
+
+base_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14,
+                                    margin = margin(b = 8), color = spotify_black),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = spotify_light),
+    panel.grid.minor = element_blank(),
+    axis.title       = element_text(size = 11, color = spotify_gray),
+    axis.text        = element_text(color = spotify_gray),
+    strip.text       = element_text(face = "bold", color = spotify_black),
+    legend.text      = element_text(color = spotify_gray),
+    legend.title     = element_text(color = spotify_black)
+  )
+```
+
+---
+
+## 3. Standardize duration_ms
+
+`duration_ms` was kept on its raw scale in feature engineering. We standardize it here before entering it into regression so its coefficient is on the same interpretable scale as the PC scores.
+
+```{r standardize-duration}
+df <- df |>
+  mutate(duration_scaled = as.numeric(scale(duration_ms)))
+
+cat("duration_ms standardized: mean =", round(mean(df$duration_scaled), 4),
+    "| sd =", round(sd(df$duration_scaled), 4), "\n")
+```
+
+---
+
+## 4. Model 1 — Audio Features Only (No Genre)
+
+This baseline model uses only the three principal components and control variables. It answers: *how much of popularity do audio characteristics explain, independent of genre?*
+
+```{r model1}
+formula_base <- popularity ~ pc1 + pc2 + pc3 + duration_scaled + explicit + mode
+
+model1 <- lm(formula_base, data = df)
+
+glance1 <- glance(model1)
+cat("Model 1 — Audio only\n")
+cat("  R²:        ", round(glance1$r.squared,   4), "\n")
+cat("  Adj. R²:   ", round(glance1$adj.r.squared, 4), "\n")
+cat("  RMSE:      ", round(glance1$sigma,         4), "\n")
+cat("  F-stat:    ", round(glance1$statistic,     2),
+    "(df =", glance1$df, ",", glance1$df.residual, ")\n")
+cat("  p-value:   ", format(glance1$p.value, scientific = TRUE), "\n")
+```
+
+```{r model1-coefs}
+tidy(model1, conf.int = TRUE) |>
+  mutate(across(where(is.numeric), ~ round(., 4))) |>
+  select(term, estimate, std.error, statistic, p.value, conf.low, conf.high)
+```
+
+**What this tells us:** Model 1 achieves an R² of just 0.0162 — audio features alone explain only **1.6% of the variation in popularity**. Despite the model being highly statistically significant (F = 268.65, p ≈ 0), statistical significance here is driven by the large sample size (n = 97,625), not practical explanatory power. The key takeaways from the coefficients:
+
+- **PC3 (Liveness & Speechiness)**: strongest audio effect (−1.26 per SD) — tracks with live recordings or heavy speech content are substantially less popular.
+- **PC2 (Danceability & Valence)**: +1.08 per SD — happier, more danceable tracks are more popular, even without controlling for genre.
+- **Explicit**: explicit tracks score 3.93 popularity points higher on average.
+- **Mode**: not significant (p = 0.188) — major vs. minor key makes no difference once audio features are included.
+
+---
+
+## 5. Model 2 — Full Model (Audio + Genre)
+
+This is our primary model. Genre captures audience size, platform curation, and cultural positioning — factors the EDA showed dominate popularity variation.
+
+```{r model2}
+formula_full <- popularity ~ pc1 + pc2 + pc3 + duration_scaled + explicit + mode +
+                             track_genre
+
+model2 <- lm(formula_full, data = df)
+
+glance2 <- glance(model2)
+cat("Model 2 — Full model (audio + genre)\n")
+cat("  R²:        ", round(glance2$r.squared,    4), "\n")
+cat("  Adj. R²:   ", round(glance2$adj.r.squared, 4), "\n")
+cat("  RMSE:      ", round(glance2$sigma,          4), "\n")
+cat("  F-stat:    ", round(glance2$statistic,      2),
+    "(df =", glance2$df, ",", glance2$df.residual, ")\n")
+cat("  p-value:   ", format(glance2$p.value, scientific = TRUE), "\n")
+```
+
+---
+
+## 6. Model Comparison
+
+```{r model-comparison}
+comparison <- tibble(
+  Model       = c("Model 1: Audio only", "Model 2: Audio + Genre"),
+  R2          = c(glance1$r.squared,     glance2$r.squared),
+  Adj_R2      = c(glance1$adj.r.squared, glance2$adj.r.squared),
+  RMSE        = c(glance1$sigma,          glance2$sigma),
+  F_statistic = c(glance1$statistic,      glance2$statistic),
+  p_value     = c(glance1$p.value,        glance2$p.value)
+) |>
+  mutate(across(c(R2, Adj_R2, RMSE), ~ round(., 4)),
+         F_statistic = round(F_statistic, 2),
+         p_value = format(p_value, scientific = TRUE))
+
+comparison
+```
+
+```{r anova-test}
+# Formal nested model comparison — tests whether adding genre
+# significantly improves fit over the audio-only model
+anova_test <- anova(model1, model2)
+cat("ANOVA nested model test:\n")
+print(anova_test)
+```
+
+**What this tells us:** Adding genre is transformative. R² jumps from **1.6% to 38.2%** — genre alone accounts for the overwhelming majority of the model's explanatory power. The ANOVA nested F-test (F = 510.23, p < 2.2e−16) confirms this improvement is highly significant. RMSE drops from 19.02 to 15.09, meaning genre reduces our average prediction error by roughly **4 popularity points**.
+
+Two additional effects shift once genre is controlled for:
+
+- **Explicit**: drops from +3.93 to +2.50 — about a third of the raw explicit effect was actually a genre effect in disguise (hip-hop/rap skew both explicit and popular).
+- **Mode**: flips from non-significant to significant (p = 0.0016, estimate = −0.33) — controlling for genre, **major key tracks are slightly less popular than minor key tracks**. This is a subtle but real finding.
+
+> **Business framing:** The R² jump from 1.6% to 38.2% is the central result of this project. It tells a label unambiguously: *genre context is the dominant driver of popularity on Spotify, not audio characteristics.* A technically strong track released into the wrong genre faces a structural ceiling that no amount of sonic optimization can overcome. Conversely, a track in a high-popularity genre starts with a built-in advantage worth roughly 10–15 popularity points over a baseline genre.
+
+---
+
+## 7. Diagnostic Plots — Full Model
+
+We check four standard OLS assumptions: linearity, homoscedasticity, normality of residuals, and absence of high-leverage outliers.
+
+```{r diagnostics-data}
+# Sample 10,000 rows for diagnostic plots — full augment() on 97k rows
+# with 114 genre levels can be slow and cause device issues in RStudio
+set.seed(42)
+diag_df <- augment(model2) |>
+  mutate(obs = row_number()) |>
+  slice_sample(n = 10000)
+```
+
+```{r diag-residuals-fitted}
+p_resfit <- ggplot(diag_df, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.05, size = 0.5, color = spotify_green) +
+  geom_hline(yintercept = 0, color = spotify_black,
+             linetype = "dashed", linewidth = 0.7) +
+  geom_smooth(method = "loess", color = "firebrick", linewidth = 0.8,
+              se = FALSE, formula = y ~ x) +
+  labs(
+    title = "Residuals vs Fitted Values",
+    x     = "Fitted Values",
+    y     = "Residuals"
+  ) +
+  base_theme
+
+p_resfit
+save_plot(p_resfit, "01_residuals_vs_fitted.png")
+```
+
+```{r diag-qq}
+p_qq <- ggplot(diag_df, aes(sample = .resid)) +
+  stat_qq(alpha = 0.05, size = 0.5, color = spotify_green) +
+  stat_qq_line(color = spotify_black, linewidth = 0.8) +
+  labs(
+    title = "Normal Q-Q Plot of Residuals",
+    x     = "Theoretical Quantiles",
+    y     = "Sample Quantiles"
+  ) +
+  base_theme
+
+p_qq
+save_plot(p_qq, "02_qq_plot.png")
+```
+
+```{r diag-scale-location}
+p_scaleloc <- ggplot(diag_df, aes(x = .fitted, y = sqrt(abs(.std.resid)))) +
+  geom_point(alpha = 0.05, size = 0.5, color = spotify_green) +
+  geom_smooth(method = "loess", color = "firebrick", linewidth = 0.8,
+              se = FALSE, formula = y ~ x) +
+  labs(
+    title = "Scale-Location Plot",
+    x     = "Fitted Values",
+    y     = expression(sqrt("|Standardized Residuals|"))
+  ) +
+  base_theme
+
+p_scaleloc
+save_plot(p_scaleloc, "03_scale_location.png")
+```
+
+```{r diag-cooks}
+p_cooks <- ggplot(diag_df, aes(x = obs, y = .cooksd)) +
+  geom_col(fill = spotify_green, width = 1) +
+  geom_hline(yintercept = 4 / nrow(df), color = "firebrick",
+             linetype = "dashed", linewidth = 0.7) +
+  annotate("text", x = nrow(df) * 0.85, y = 4 / nrow(df) * 1.15,
+           label = "Cook's D threshold (4/n)",
+           color = "firebrick", size = 3, hjust = 1) +
+  labs(
+    title = "Cook's Distance — Influence of Observations",
+    x     = "Observation Index",
+    y     = "Cook's Distance"
+  ) +
+  base_theme
+
+p_cooks
+save_plot(p_cooks, "04_cooks_distance.png")
+```
+
+```{r diagnostics-summary}
+n_influential <- sum(diag_df$.cooksd > 4 / nrow(diag_df))
+cat("Observations exceeding Cook's D threshold (4/n =",
+    round(4/nrow(diag_df), 6), "):", n_influential,
+    "(", round(n_influential/nrow(diag_df)*100, 2), "% of sample)\n")
+```
+
+---
+
+## 8. Coefficient Interpretation — Audio & Control Variables
+
+We extract only the non-genre coefficients from Model 2 for clean interpretation.
+
+```{r coef-audio}
+coef_audio <- tidy(model2, conf.int = TRUE) |>
+  filter(!str_detect(term, "track_genre")) |>
+  mutate(
+    significant = p.value < 0.05,
+    across(where(is.numeric), ~ round(., 4))
+  ) |>
+  select(term, estimate, std.error, statistic, p.value, conf.low, conf.high, significant)
+
+coef_audio
+```
+
+**Interpretation — controlling for genre, what actually matters sonically:**
+
+| Term | Estimate | Interpretation |
+|------|----------|----------------|
+| PC1 (Acoustic vs. Electronic) | +0.096* | Slightly more acoustic tracks are marginally more popular within their genre — but the effect is tiny and barely significant |
+| PC2 (Danceability & Valence) | +0.212*** | More danceable, positive-sounding tracks score ~0.21 points higher per SD — small but consistent |
+| PC3 (Liveness & Speechiness) | −0.889*** | Strongest audio signal: live/spoken tracks are substantially less popular, even within genre |
+| duration_scaled | −0.184*** | Shorter tracks perform better — each SD increase in duration costs ~0.18 popularity points |
+| explicit | +2.50*** | Explicit tracks score 2.5 points higher, even after controlling for genre |
+| mode (major) | −0.328*** | Major key tracks are 0.33 points less popular than minor key tracks — a surprising reversal that only appears after genre is controlled |
+
+All coefficients are statistically significant at p < 0.05 except the note on PC1 (p = 0.021, borderline). Effect sizes are small — no single audio dimension moves the needle by more than 1 popularity point per standard deviation.
+
+> **Business framing:** Within any given genre, the audio characteristic that hurts popularity most is a live or spoken-word feel (PC3). Labels should ensure studio tracks are clean and production-ready — this is the one sonic lever with a meaningful, genre-independent effect on popularity.
+
+---
+
+## 9. Genre Effects — Top and Bottom Genres
+
+With 114 genre levels in the model, each coefficient represents the mean popularity difference for that genre relative to the reference category (the baseline genre R chose alphabetically). We extract and visualize the top 10 and bottom 10 genre effects.
+
+```{r genre-effects}
+ref_genre <- levels(df$track_genre)[1]
+cat("Reference genre (baseline):", ref_genre, "\n")
+
+genre_coefs <- tidy(model2, conf.int = TRUE) |>
+  filter(str_detect(term, "track_genre")) |>
+  mutate(
+    genre   = str_remove(term, "track_genre"),
+    across(where(is.numeric), ~ round(., 3))
+  ) |>
+  select(genre, estimate, std.error, p.value, conf.low, conf.high) |>
+  arrange(desc(estimate))
+
+cat("\nTop 10 genres (highest popularity vs. reference):\n")
+print(head(genre_coefs, 10))
+
+cat("\nBottom 10 genres (lowest popularity vs. reference):\n")
+print(tail(genre_coefs, 10))
+```
+
+**What this tells us:** Genre effects are large and highly significant across the board (all p ≈ 0). The spread is enormous:
+
+- **Top genres**: pop-film (+14.7), k-pop (+14.5), pop (+13.5), electro (+12.7), house (+12.0) — all streaming-native, playlist-friendly genres with large global audiences on Spotify.
+- **Bottom genres**: iranian (−38.0), romance (−35.4), detroit-techno (−33.9), chicago-house (−32.8), grindcore (−29.6) — niche genres with small or non-mainstream Spotify audiences.
+- The **total genre spread is ~53 popularity points** (from −38 to +14.7), dwarfing any audio feature effect.
+
+Note that all coefficients are relative to the reference genre (the alphabetically first genre in the dataset). What matters is the relative ranking, not the absolute values.
+
+```{r genre-plot}
+genre_plot_df <- bind_rows(
+  head(genre_coefs, 10) |> mutate(group = "Top 10"),
+  tail(genre_coefs, 10) |> mutate(group = "Bottom 10")
+) |>
+  mutate(genre = fct_reorder(genre, estimate))
+
+p_genre <- ggplot(genre_plot_df,
+                  aes(x = estimate, y = genre, fill = estimate > 0)) +
+  geom_col(width = 0.7) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.3, color = spotify_gray, linewidth = 0.5) +
+  geom_vline(xintercept = 0, color = spotify_black,
+             linetype = "dashed", linewidth = 0.6) +
+  scale_fill_manual(values = c("TRUE" = spotify_green, "FALSE" = "#B22222"),
+                    guide  = "none") +
+  facet_wrap(~group, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Genre Effects on Popularity (vs. Reference Genre)",
+    x     = "Coefficient Estimate (popularity points)",
+    y     = NULL
+  ) +
+  base_theme
+
+p_genre
+save_plot(p_genre, "05_genre_effects.png", height = 8)
+```
+
+---
+
+## 10. Model Performance Summary
+
+```{r performance-summary}
+# Predictions and error metrics on the full dataset
+df <- df |>
+  mutate(
+    predicted   = predict(model2, newdata = df),
+    residual    = popularity - predicted
+  )
+
+rmse <- sqrt(mean(df$residual^2))
+mae  <- mean(abs(df$residual))
+r2   <- glance2$r.squared
+
+cat("Full model performance:\n")
+cat("  R²:   ", round(r2,   4), "\n")
+cat("  RMSE: ", round(rmse, 4), "popularity points\n")
+cat("  MAE:  ", round(mae,  4), "popularity points\n")
+```
+
+```{r predicted-vs-actual}
+set.seed(42)
+df_sample <- df |> slice_sample(n = 5000)
+
+p_pred <- ggplot(df_sample, aes(x = predicted, y = popularity)) +
+  geom_point(alpha = 0.1, size = 0.6, color = spotify_green) +
+  geom_abline(slope = 1, intercept = 0, color = spotify_black,
+              linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title = "Predicted vs Actual Popularity (sample of 5,000)",
+    x     = "Predicted Popularity",
+    y     = "Actual Popularity"
+  ) +
+  base_theme
+
+p_pred
+save_plot(p_pred, "06_predicted_vs_actual.png")
+```
+
+**What this tells us:** The full model achieves an **RMSE of 15.08** and **MAE of 10.82** on the 0–100 popularity scale. On average, predictions are off by about 10–15 popularity points. The predicted vs. actual plot will likely show that the model captures the central mass of tracks (popularity 20–60) reasonably well but struggles at the extremes — very low popularity tracks are over-predicted and very high popularity tracks are under-predicted. This is a known limitation of OLS with a bounded, skewed outcome variable.
+
+> **Business framing:** An RMSE of ~15 on a 0–100 scale means this model is a useful but imprecise screening tool — appropriate for ranking and filtering, not for point-estimate forecasting. A label can use it to identify tracks in high-popularity genres with strong sonic profiles as candidates for promotion, accepting that the model cannot reliably distinguish a score of 55 from 70.
+
+---
+
+## 11. Save Outputs
+
+```{r save}
+saveRDS(model2, "../data/model_full.rds")
+saveRDS(model1, "../data/model_audio_only.rds")
+
+write_csv(coef_audio,  file.path(out_dir, "coefficients_audio.csv"))
+write_csv(genre_coefs, file.path(out_dir, "coefficients_genre.csv"))
+write_csv(comparison,  file.path(out_dir, "model_comparison.csv"))
+
+cat("Saved: ../data/model_full.rds\n")
+cat("Saved: ../data/model_audio_only.rds\n")
+cat("Saved: ../outputs/regression/coefficients_audio.csv\n")
+cat("Saved: ../outputs/regression/coefficients_genre.csv\n")
+cat("Saved: ../outputs/regression/model_comparison.csv\n")
+cat("\nRegression complete.\n")
+```
+
+---
+
+*Next: `06_report.Rmd` — Final report with executive summary and technical write-up.*

@@ -1,0 +1,3 @@
+Model,R2,Adj_R2,RMSE,F_statistic,p_value
+Model 1: Audio only,0.0162,0.0162,19.0232,268.65,0e+00
+Model 2: Audio + Genre,0.3818,0.381,15.0889,506.03,0e+00

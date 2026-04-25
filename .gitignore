@@ -1,0 +1,41 @@
+# R session files
+.RData
+.Rhistory
+.Rapp.history
+*.Rproj.user/
+
+# RStudio internals
+.Rproj.user/
+
+# Large data files — download raw data from Kaggle (see README)
+data/spotify_tracks.csv
+data/spotify_cleaned.csv
+data/spotify_cleaned.rds
+data/spotify_model.csv
+data/spotify_model.rds
+data/spotify_pca.rds
+data/model_full.rds
+data/model_audio_only.rds
+data/pca_result.rds
+data/scaling_params.rds
+
+# Knitted HTML outputs (re-generate by knitting Rmd files)
+scripts/*.html
+
+# Node.js artifacts
+node_modules/
+package.json
+package-lock.json
+build_report.js
+
+# Report files
+report/
+
+# macOS junk
+.DS_Store
+outputs/.DS_Store
+scripts/.DS_Store
+
+# Word temp files
+~$*.docx
+~$*.doc
