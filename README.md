@@ -36,15 +36,17 @@ Download `spotify_tracks.csv` from Kaggle and place it at `data/spotify_tracks.c
 spotifyproject/
 ├── data/                    # Place spotify_tracks.csv here (see above)
 ├── scripts/
-│   ├── 01_data_import.Rmd   # Data cleaning and preprocessing
-│   ├── 02_eda.Rmd           # Exploratory data analysis
+│   ├── 01_data_import.Rmd          # Data cleaning and preprocessing
+│   ├── 02_eda.Rmd                  # Exploratory data analysis
 │   ├── 03_feature_engineering.Rmd  # Outlier removal, standardization
-│   ├── 04_pca.Rmd           # Principal Component Analysis
-│   └── 05_regression.Rmd    # Multiple Linear Regression
+│   ├── 04_pca.Rmd                  # Principal Component Analysis
+│   ├── 05_regression.Rmd           # Multiple Linear Regression + VIF analysis
+│   └── 06_bootstrap.Rmd            # Bootstrap validation (B=1,000) vs OLS CIs
 ├── outputs/
 │   ├── eda/                 # EDA plots and correlation table
 │   ├── pca/                 # Scree plot, loadings heatmap, biplot
-│   └── regression/          # Diagnostic plots, genre effects, coefficients
+│   ├── regression/          # Diagnostic plots, genre effects, coefficients
+│   └── bootstrap/           # Bootstrap distributions, OLS vs bootstrap CI plot
 └── README.md
 ```
 
@@ -62,6 +64,7 @@ rmarkdown::render("scripts/02_eda.Rmd")
 rmarkdown::render("scripts/03_feature_engineering.Rmd")
 rmarkdown::render("scripts/04_pca.Rmd")
 rmarkdown::render("scripts/05_regression.Rmd")
+rmarkdown::render("scripts/06_bootstrap.Rmd")
 ```
 
 Each script loads its input from the `data/` folder and saves outputs to `outputs/`.
@@ -69,7 +72,7 @@ Each script loads its input from the `data/` folder and saves outputs to `output
 ### Required R Packages
 
 ```r
-install.packages(c("tidyverse", "skimr", "janitor", "ggcorrplot", "factoextra", "broom"))
+install.packages(c("tidyverse", "skimr", "janitor", "ggcorrplot", "factoextra", "broom", "car"))
 ```
 
 ---

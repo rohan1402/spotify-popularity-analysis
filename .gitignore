@@ -18,6 +18,7 @@ data/model_full.rds
 data/model_audio_only.rds
 data/pca_result.rds
 data/scaling_params.rds
+data/bootstrap_coefs.rds
 
 # Knitted HTML outputs (re-generate by knitting Rmd files)
 scripts/*.html
@@ -39,3 +40,4 @@ scripts/.DS_Store
 # Word temp files
 ~$*.docx
 ~$*.doc
+.positai

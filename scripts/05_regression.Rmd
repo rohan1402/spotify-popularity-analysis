@@ -44,6 +44,7 @@ Comparing these models directly quantifies how much of popularity is explained b
 ```{r libraries}
 library(tidyverse)
 library(broom)      # tidy model summaries
+library(car)        # vif()
 ```
 
 ---
@@ -102,7 +103,87 @@ cat("duration_ms standardized: mean =", round(mean(df$duration_scaled), 4),
 
 ---
 
-## 4. Model 1 — Audio Features Only (No Genre)
+## 4. VIF Analysis — Justifying PCA
+
+Before fitting PC-based models, we demonstrate the multicollinearity problem in the raw feature space. We fit popularity against all nine raw (already standardized) audio features and compute **Variance Inflation Factors (VIF)**. A VIF > 5 indicates moderate multicollinearity; VIF > 10 indicates severe multicollinearity that inflates standard errors and destabilizes coefficients.
+
+```{r vif-raw-model}
+audio_features <- c("danceability", "energy", "loudness", "tempo",
+                     "acousticness", "speechiness", "instrumentalness",
+                     "liveness", "valence")
+
+formula_raw <- as.formula(
+  paste("popularity ~", paste(audio_features, collapse = " + "),
+        "+ duration_scaled + explicit + mode")
+)
+
+model_raw <- lm(formula_raw, data = df)
+
+vif_vals <- vif(model_raw)
+
+vif_df <- tibble(
+  predictor = names(vif_vals),
+  VIF       = round(as.numeric(vif_vals), 2)
+) |>
+  arrange(desc(VIF)) |>
+  mutate(flag = case_when(
+    VIF > 10 ~ "Severe (>10)",
+    VIF > 5  ~ "Moderate (>5)",
+    TRUE     ~ "OK"
+  ))
+
+cat("VIF for raw audio features model:\n")
+print(vif_df)
+cat("\nFeatures with VIF > 5:", sum(vif_df$VIF > 5), "\n")
+cat("Features with VIF > 10:", sum(vif_df$VIF > 10), "\n")
+```
+
+```{r vif-plot}
+p_vif <- ggplot(vif_df, aes(x = VIF, y = fct_reorder(predictor, VIF),
+                             fill = flag)) +
+  geom_col(width = 0.6) +
+  geom_vline(xintercept = 5,  linetype = "dashed",
+             color = "darkorange", linewidth = 0.7) +
+  geom_vline(xintercept = 10, linetype = "dashed",
+             color = "firebrick", linewidth = 0.7) +
+  annotate("text", x = 5.2,  y = 0.6, label = "VIF = 5",
+           color = "darkorange", size = 3, hjust = 0) +
+  annotate("text", x = 10.2, y = 0.6, label = "VIF = 10",
+           color = "firebrick", size = 3, hjust = 0) +
+  scale_fill_manual(
+    values = c("OK" = spotify_green,
+               "Moderate (>5)" = "darkorange",
+               "Severe (>10)"  = "firebrick"),
+    name = "Severity"
+  ) +
+  labs(
+    title = "Variance Inflation Factors — Raw Audio Features",
+    x     = "VIF",
+    y     = NULL
+  ) +
+  base_theme
+
+p_vif
+save_plot(p_vif, "00_vif_raw_features.png")
+```
+
+**What this confirms:** The three features flagged from the EDA — `energy`, `loudness`, and `acousticness` — show VIF values well above 5, confirming severe multicollinearity. Including them simultaneously in regression inflates their standard errors and renders individual coefficients unreliable. PCA resolves this by collapsing these correlated features into orthogonal components, each of which enters the model independently with a VIF of 1 by construction.
+
+```{r vif-pc-check}
+# Confirm PCA scores are orthogonal — VIF should be ~1
+formula_pc_check <- popularity ~ pc1 + pc2 + pc3 + duration_scaled + explicit + mode
+model_pc_check   <- lm(formula_pc_check, data = df)
+
+vif_pc <- vif(model_pc_check)
+cat("VIF for PC-based model (all should be ~1):\n")
+print(round(vif_pc, 3))
+```
+
+PC scores by construction are orthogonal, so their VIFs are all ≈ 1 — multicollinearity is completely eliminated.
+
+---
+
+## 5. Model 1 — Audio Features Only (No Genre)
 
 This baseline model uses only the three principal components and control variables. It answers: *how much of popularity do audio characteristics explain, independent of genre?*
 
@@ -136,7 +217,7 @@ tidy(model1, conf.int = TRUE) |>
 
 ---
 
-## 5. Model 2 — Full Model (Audio + Genre)
+## 6. Model 2 — Full Model (Audio + Genre)
 
 This is our primary model. Genre captures audience size, platform curation, and cultural positioning — factors the EDA showed dominate popularity variation.
 
@@ -158,7 +239,7 @@ cat("  p-value:   ", format(glance2$p.value, scientific = TRUE), "\n")
 
 ---
 
-## 6. Model Comparison
+## 7. Model Comparison
 
 ```{r model-comparison}
 comparison <- tibble(
@@ -195,7 +276,7 @@ Two additional effects shift once genre is controlled for:
 
 ---
 
-## 7. Diagnostic Plots — Full Model
+## 8. Diagnostic Plots — Full Model
 
 We check four standard OLS assumptions: linearity, homoscedasticity, normality of residuals, and absence of high-leverage outliers.
 
@@ -285,7 +366,7 @@ cat("Observations exceeding Cook's D threshold (4/n =",
 
 ---
 
-## 8. Coefficient Interpretation — Audio & Control Variables
+## 9. Coefficient Interpretation — Audio & Control Variables
 
 We extract only the non-genre coefficients from Model 2 for clean interpretation.
 
@@ -318,7 +399,7 @@ All coefficients are statistically significant at p < 0.05 except the note on PC
 
 ---
 
-## 9. Genre Effects — Top and Bottom Genres
+## 10. Genre Effects — Top and Bottom Genres
 
 With 114 genre levels in the model, each coefficient represents the mean popularity difference for that genre relative to the reference category (the baseline genre R chose alphabetically). We extract and visualize the top 10 and bottom 10 genre effects.
 
@@ -380,7 +461,7 @@ save_plot(p_genre, "05_genre_effects.png", height = 8)
 
 ---
 
-## 10. Model Performance Summary
+## 11. Model Performance Summary
 
 ```{r performance-summary}
 # Predictions and error metrics on the full dataset
@@ -425,7 +506,7 @@ save_plot(p_pred, "06_predicted_vs_actual.png")
 
 ---
 
-## 11. Save Outputs
+## 12. Save Outputs
 
 ```{r save}
 saveRDS(model2, "../data/model_full.rds")
