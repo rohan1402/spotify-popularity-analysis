@@ -41,12 +41,16 @@ spotifyproject/
 │   ├── 03_feature_engineering.Rmd  # Outlier removal, standardization
 │   ├── 04_pca.Rmd                  # Principal Component Analysis
 │   ├── 05_regression.Rmd           # Multiple Linear Regression + VIF analysis
-│   └── 06_bootstrap.Rmd            # Bootstrap validation (B=1,000) vs OLS CIs
+│   ├── 06_bootstrap.Rmd            # Bootstrap validation (B=1,000) vs OLS CIs
+│   ├── 07_monte_carlo.Rmd          # Monte Carlo genre optimizer (B=5,000 per genre)
+│   └── 08_genre_deepdive.Rmd       # EM clustering + K-means sonic fingerprints
 ├── outputs/
 │   ├── eda/                 # EDA plots and correlation table
 │   ├── pca/                 # Scree plot, loadings heatmap, biplot
 │   ├── regression/          # Diagnostic plots, genre effects, coefficients
-│   └── bootstrap/           # Bootstrap distributions, OLS vs bootstrap CI plot
+│   ├── bootstrap/           # Bootstrap distributions, OLS vs bootstrap CI plot
+│   ├── monte_carlo/         # Genre optimizer plots and ranked CSV outputs per profile
+│   └── genre_deepdive/      # EM density plots, success map, cluster fingerprints
 └── README.md
 ```
 
@@ -65,14 +69,19 @@ rmarkdown::render("scripts/03_feature_engineering.Rmd")
 rmarkdown::render("scripts/04_pca.Rmd")
 rmarkdown::render("scripts/05_regression.Rmd")
 rmarkdown::render("scripts/06_bootstrap.Rmd")
+rmarkdown::render("scripts/07_monte_carlo.Rmd")
+rmarkdown::render("scripts/08_genre_deepdive.Rmd")
 ```
 
 Each script loads its input from the `data/` folder and saves outputs to `outputs/`.
 
+> **Note:** Script 06 (`bootstrap`) is computationally intensive (B=1,000 resamples on ~97k rows). Script 07 (`monte_carlo`) runs 5,000 draws × 114 genres × 4 audio profiles — expect ~10–15 minutes on a standard laptop. Scripts 01–05 and 08 are fast.
+
 ### Required R Packages
 
 ```r
-install.packages(c("tidyverse", "skimr", "janitor", "ggcorrplot", "factoextra", "broom", "car"))
+install.packages(c("tidyverse", "skimr", "janitor", "ggcorrplot", "factoextra",
+                   "broom", "car", "mclust"))
 ```
 
 ---
@@ -94,6 +103,13 @@ install.packages(c("tidyverse", "skimr", "janitor", "ggcorrplot", "factoextra", 
 **Top genres by popularity:** pop-film, k-pop, pop, electro, house  
 **Bottom genres by popularity:** iranian, romance, detroit-techno, chicago-house, grindcore  
 **Genre spread:** 52.7 popularity points between highest and lowest genre coefficients
+
+**EM Genre Tiers (from `08_genre_deepdive.Rmd`):**
+| Tier | Genres | Mean Popularity |
+|------|--------|----------------|
+| Premium | 47 | 49.8 |
+| Mid-tier | 20 | 41.6 |
+| Niche | 47 | 27.0 |
 
 ---
 

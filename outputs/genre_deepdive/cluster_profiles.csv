@@ -1,0 +1,6 @@
+cluster,n_genres,mean_popularity,mean_pc1,mean_pc2,mean_pc3,top_genre,bottom_genre
+C5,42,41.63,-0.615,0.535,0.001,afrobeat,afrobeat
+C3,26,40.41,0.888,0.524,-0.039,acoustic,acoustic
+C1,36,37.45,-0.655,-0.769,-0.19,alt-rock,alt-rock
+C2,9,30.14,3.096,-0.634,0.048,ambient,ambient
+C4,1,24.64,-0.114,0.7,5.872,comedy,comedy

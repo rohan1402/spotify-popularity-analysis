@@ -264,9 +264,9 @@ p_ci <- ggplot(ci_long,
                    color = method, shape = method)) +
   geom_errorbarh(aes(xmin = lower, xmax = upper),
                  height = 0.25, linewidth = 0.8,
-                 position = position_dodgev(height = 0.5)) +
+                 position = position_dodge(width = 0.5)) +
   geom_point(size = 3,
-             position = position_dodgev(height = 0.5)) +
+             position = position_dodge(width = 0.5)) +
   geom_vline(xintercept = 0, linetype = "dashed",
              color = spotify_gray, linewidth = 0.6) +
   scale_color_manual(values = c("OLS" = spotify_black, "Bootstrap" = spotify_green),

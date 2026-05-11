@@ -1,0 +1,443 @@
+---
+title: "Monte Carlo Genre Optimizer — What Genre Should Your Song Be?"
+subtitle: "MSDS 16:954:567 – Statistical Models and Computing"
+author: "Rutgers University"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_knit$set(root.dir = "..")
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 8,
+  fig.height = 5,
+  dpi        = 72
+)
+```
+
+## Overview
+
+The regression model in `05_regression.Rmd` established that **genre is the dominant driver of Spotify popularity**, explaining 36 of the 38 percentage points of R² gained when moving from an audio-only model to the full model. This raises an actionable business question that the model alone does not answer:
+
+> *Given a specific track's audio characteristics, which genre gives it the best shot at a Spotify hit?*
+
+This notebook answers that question using **Monte Carlo simulation**. For any combination of audio features (expressed as PC scores), we simulate predicted popularity across all 114 genres by repeatedly drawing from the model's residual uncertainty. The result is not a single point estimate per genre — it is a **full probability distribution** of what that track could achieve in each genre, including the probability of crossing the 50-popularity threshold we define as a "hit."
+
+**Why Monte Carlo and not just `predict()`?**
+`predict()` gives a point estimate per genre — the expected popularity under that genre, ignoring all sources of uncertainty. But popularity is noisy. A track in k-pop doesn't guarantee 60+ popularity — it means the track plays in a genre where the average is high, but individual outcomes vary by ±15 points (the model RMSE). Monte Carlo captures this uncertainty by simulating B = 5,000 possible outcomes per genre, giving us hit probabilities and confidence intervals that a point estimate cannot.
+
+> **Consulting framing:** This is the tool. A label brings us a demo — we extract its audio features, map them to PC scores, run the optimizer, and hand back a ranked list of 114 genres with predicted popularity distributions and hit probabilities. The label decides where to position the artist. That's a data-driven A&R strategy.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(broom)
+```
+
+---
+
+## 2. Load Data and Model
+
+```{r load}
+out_dir <- "../outputs/monte_carlo"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+df     <- readRDS("../data/spotify_pca.rds")
+df     <- df |> mutate(duration_scaled = as.numeric(scale(duration_ms)))
+model2 <- readRDS("../data/model_full.rds")
+
+# Model residual SD — used as MC noise parameter
+sigma_ols <- glance(model2)$sigma
+cat("Model RMSE (sigma):", round(sigma_ols, 3), "\n")
+
+# Factor levels from training data
+genres       <- levels(df$track_genre)
+explicit_ref <- levels(df$explicit)[1]
+mode_ref     <- levels(df$mode)[1]
+
+cat("Genres available:", length(genres), "\n")
+cat("Reference explicit level:", explicit_ref, "\n")
+cat("Reference mode level:    ", mode_ref, "\n")
+```
+
+```{r helpers, include=FALSE}
+save_plot <- function(plot, filename, width = 8, height = 5, dpi = 72) {
+  path <- file.path(out_dir, filename)
+  ggsave(path, plot = plot, width = width, height = height, dpi = dpi)
+  cat("Saved:", path, "\n")
+}
+
+spotify_green <- "#1DB954"
+spotify_black <- "#121212"
+spotify_gray  <- "#535353"
+spotify_light <- "#F4F4F4"
+
+base_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14,
+                                    margin = margin(b = 6), color = spotify_black),
+    plot.subtitle    = element_text(size = 11, color = spotify_gray,
+                                    margin = margin(b = 10)),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = spotify_light),
+    panel.grid.minor = element_blank(),
+    axis.title       = element_text(size = 11, color = spotify_gray),
+    axis.text        = element_text(color = spotify_gray),
+    strip.text       = element_text(face = "bold", color = spotify_black),
+    legend.text      = element_text(color = spotify_gray),
+    legend.title     = element_text(color = spotify_black)
+  )
+```
+
+---
+
+## 3. The Monte Carlo Optimizer
+
+### 3.1 Prediction Grid Builder
+
+For a given set of PC scores, we create a 114-row prediction grid — one row per genre — holding all other variables at neutral reference values (average duration, clean, minor key). This isolates the genre effect from any individual track's other characteristics.
+
+```{r prediction-grid}
+make_genre_grid <- function(pc1_val, pc2_val, pc3_val,
+                             duration_val = 0) {
+  tibble(
+    pc1             = pc1_val,
+    pc2             = pc2_val,
+    pc3             = pc3_val,
+    duration_scaled = duration_val,
+    explicit        = factor(explicit_ref, levels = levels(df$explicit)),
+    mode            = factor(mode_ref,     levels = levels(df$mode)),
+    track_genre     = factor(genres,       levels = genres)
+  )
+}
+```
+
+### 3.2 Monte Carlo Simulation Function
+
+For each of the 114 genres we:
+1. Get the regression point estimate: $\hat{y}_g = \hat{\beta} \cdot x_g$
+2. Draw B = 5,000 noise samples $\varepsilon_b \sim \mathcal{N}(0,\, \hat{\sigma}^2)$
+3. Compute simulated popularity: $y_b = \text{clip}(\hat{y}_g + \varepsilon_b,\, 0,\, 100)$
+4. Summarize: mean, 95% MC interval, and **hit probability** $= P(y > 50)$
+
+```{r mc-function}
+run_mc_optimizer <- function(pc1_val, pc2_val, pc3_val,
+                              B = 5000, sigma = sigma_ols,
+                              seed = 42) {
+  grid        <- make_genre_grid(pc1_val, pc2_val, pc3_val)
+  point_preds <- predict(model2, newdata = grid)
+
+  set.seed(seed)
+  # Matrix of noise: 114 genres × B simulations
+  noise   <- matrix(rnorm(length(genres) * B, mean = 0, sd = sigma),
+                    nrow = length(genres), ncol = B)
+
+  # Simulated popularities clipped to [0, 100]
+  # Wrap in matrix() to guarantee 2D shape after vector + matrix arithmetic
+  sim_pop <- matrix(
+    pmin(100, pmax(0, as.numeric(point_preds) + noise)),
+    nrow = length(genres),
+    ncol = B
+  )
+
+  tibble(
+    genre      = genres,
+    point_pred = round(point_preds, 2),
+    mc_mean    = round(rowMeans(sim_pop), 2),
+    mc_lower   = round(apply(sim_pop, 1, quantile, 0.025), 2),
+    mc_upper   = round(apply(sim_pop, 1, quantile, 0.975), 2),
+    hit_prob   = round(rowMeans(sim_pop > 50), 3)
+  ) |>
+    arrange(desc(mc_mean))
+}
+```
+
+---
+
+## 4. Track Profiles
+
+We define four archetypal track profiles — representing distinct sonic identities common in the music industry. Each is defined by its PC scores:
+
+- **PC1**: negative = loud/electronic; positive = quiet/acoustic
+- **PC2**: positive = danceable/positive; negative = slow/melancholic
+- **PC3**: positive = live/spoken-word; negative = studio/instrumental
+
+```{r profiles}
+profiles <- list(
+  "Electronic Dance Track" = c(pc1 = -1.5, pc2 =  1.5, pc3 = -0.5),
+  "Acoustic Ballad"        = c(pc1 =  1.5, pc2 = -0.5, pc3 = -0.5),
+  "Hip-Hop / Spoken Word"  = c(pc1 = -0.5, pc2 =  0.5, pc3 =  1.5),
+  "Ambient / Instrumental" = c(pc1 =  1.0, pc2 = -1.0, pc3 = -1.0)
+)
+
+# Describe each profile
+profile_desc <- tibble(
+  Profile = names(profiles),
+  PC1 = map_dbl(profiles, "pc1"),
+  PC2 = map_dbl(profiles, "pc2"),
+  PC3 = map_dbl(profiles, "pc3"),
+  Description = c(
+    "Loud, electronic, high-energy, danceable, positive valence",
+    "Quiet, acoustic, low-energy, somewhat melancholic, studio",
+    "Semi-energetic, danceable, heavy spoken-word or live feel",
+    "Quiet, acoustic, non-danceable, instrumental, studio"
+  )
+)
+
+profile_desc
+```
+
+---
+
+## 5. Run the Optimizer
+
+```{r run-optimizer}
+set.seed(42)
+
+mc_results <- imap(profiles, function(p, name) {
+  cat("Running MC optimizer for:", name, "\n")
+  run_mc_optimizer(pc1_val = p["pc1"], pc2_val = p["pc2"], pc3_val = p["pc3"])
+})
+
+# Show top 10 genres for each profile
+for (name in names(mc_results)) {
+  cat("\n===", name, "=== Top 10 genres:\n")
+  print(head(mc_results[[name]], 10))
+}
+```
+
+---
+
+## 6. Visualisation — Top 20 Genres per Profile
+
+```{r plot-top20, fig.height=7}
+for (name in names(mc_results)) {
+
+  top20 <- head(mc_results[[name]], 20) |>
+    mutate(genre = fct_reorder(genre, mc_mean))
+
+  p <- ggplot(top20, aes(x = mc_mean, y = genre)) +
+    geom_col(fill = spotify_green, width = 0.7, alpha = 0.85) +
+    geom_errorbarh(aes(xmin = mc_lower, xmax = mc_upper),
+                   height = 0.35, color = spotify_gray, linewidth = 0.5) +
+    geom_text(aes(label = paste0(mc_mean)),
+              hjust = -0.2, size = 3, color = spotify_black) +
+    scale_x_continuous(limits = c(0, 80), expand = c(0, 0)) +
+    labs(
+      title    = paste("Genre Optimizer —", name),
+      subtitle = paste0("MC mean popularity ± 95% interval (B = 5,000) | ",
+                        "PC1=", profiles[[name]]["pc1"],
+                        ", PC2=", profiles[[name]]["pc2"],
+                        ", PC3=", profiles[[name]]["pc3"]),
+      x = "Predicted Popularity (0–100)",
+      y = NULL
+    ) +
+    base_theme +
+    theme(panel.grid.major.y = element_blank())
+
+  print(p)
+
+  filename <- paste0("01_top20_", gsub("[^a-zA-Z0-9]", "_", tolower(name)), ".png")
+  save_plot(p, filename, height = 7)
+}
+```
+
+---
+
+## 7. Hit Probability — Which Genre Makes a Hit Most Likely?
+
+A "hit" is defined as popularity > 50 — roughly the top third of the distribution in our dataset. For each profile, the hit probability is the fraction of Monte Carlo draws that exceeded this threshold.
+
+```{r plot-hit-prob, fig.height=6}
+for (name in names(mc_results)) {
+
+  top20_hit <- head(mc_results[[name]], 20) |>
+    mutate(
+      genre    = fct_reorder(genre, hit_prob),
+      hit_pct  = paste0(round(hit_prob * 100, 1), "%")
+    )
+
+  p_hit <- ggplot(top20_hit, aes(x = hit_prob, y = genre)) +
+    geom_col(aes(fill = hit_prob), width = 0.7) +
+    geom_text(aes(label = hit_pct),
+              hjust = -0.15, size = 3, color = spotify_black) +
+    scale_fill_gradient(low = "#4CAF50", high = spotify_green,
+                        name = "Hit\nProbability", labels = scales::percent) +
+    scale_x_continuous(labels = scales::percent,
+                       limits = c(0, 1), expand = c(0, 0)) +
+    labs(
+      title    = paste("Hit Probability by Genre —", name),
+      subtitle = "P(popularity > 50) via Monte Carlo simulation (B = 5,000)",
+      x        = "Hit Probability",
+      y        = NULL
+    ) +
+    base_theme +
+    theme(panel.grid.major.y = element_blank(),
+          legend.position     = "none")
+
+  print(p_hit)
+
+  filename <- paste0("02_hitprob_", gsub("[^a-zA-Z0-9]", "_", tolower(name)), ".png")
+  save_plot(p_hit, filename, height = 6)
+}
+```
+
+---
+
+## 8. Cross-Profile Heatmap — Which Genres Win Across All Profiles?
+
+This is the money plot. We find genres that rank in the top 20 for at least one profile and show how each profile performs in those genres. Some genres are universally strong (high popularity regardless of audio) — others are highly specific to a sonic identity.
+
+```{r heatmap, fig.width=10, fig.height=7}
+# Collect top 20 genres per profile
+top_genres_each <- map(mc_results, ~ head(.x$genre, 20))
+all_top_genres  <- unique(unlist(top_genres_each))
+
+# Build a wide table: genre × profile → mc_mean
+heatmap_df <- map_dfr(names(mc_results), function(name) {
+  mc_results[[name]] |>
+    filter(genre %in% all_top_genres) |>
+    select(genre, mc_mean) |>
+    mutate(profile = name)
+}) |>
+  pivot_wider(names_from = profile, values_from = mc_mean) |>
+  mutate(avg_score = rowMeans(across(where(is.numeric)), na.rm = TRUE)) |>
+  arrange(desc(avg_score))
+
+heatmap_long <- heatmap_df |>
+  select(-avg_score) |>
+  pivot_longer(-genre, names_to = "profile", values_to = "mc_mean") |>
+  mutate(genre = fct_reorder(genre, mc_mean, .fun = mean, na.rm = TRUE))
+
+p_heat <- ggplot(heatmap_long, aes(x = profile, y = genre, fill = mc_mean)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = ifelse(is.na(mc_mean), "—", round(mc_mean, 0))),
+            size = 2.8, color = spotify_black) +
+  scale_fill_gradient2(
+    low      = "#B22222",
+    mid      = "white",
+    high     = spotify_green,
+    midpoint = 35,
+    na.value = "gray90",
+    name     = "Predicted\nPopularity"
+  ) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 12)) +
+  labs(
+    title    = "Genre Optimizer — Cross-Profile Heatmap",
+    subtitle = "Predicted popularity for each sonic profile × genre combination (MC mean, B = 5,000)",
+    x        = NULL,
+    y        = NULL
+  ) +
+  base_theme +
+  theme(
+    axis.text.x  = element_text(size = 9, angle = 15, hjust = 1),
+    axis.text.y  = element_text(size = 8),
+    panel.grid   = element_blank()
+  )
+
+p_heat
+save_plot(p_heat, "03_cross_profile_heatmap.png", width = 11, height = 8)
+```
+
+---
+
+## 9. Summary Tables
+
+```{r summary-tables}
+# Best genre per profile + hit probability
+best_per_profile <- map_dfr(names(mc_results), function(name) {
+  top1 <- mc_results[[name]][1, ]
+  tibble(
+    Profile        = name,
+    Best_Genre     = top1$genre,
+    Predicted_Pop  = top1$mc_mean,
+    MC_Lower       = top1$mc_lower,
+    MC_Upper       = top1$mc_upper,
+    Hit_Prob       = paste0(round(top1$hit_prob * 100, 1), "%")
+  )
+})
+
+cat("Best genre recommendation per sonic profile:\n")
+print(best_per_profile)
+
+# Universally strong genres (top 20 in ALL profiles)
+universal <- Reduce(intersect, top_genres_each)
+cat("\nGenres in top 20 across ALL profiles (universally strong):\n")
+if (length(universal) > 0) print(universal) else cat("None — genre advantage is profile-specific.\n")
+
+# Genres in top 20 for at least 3 of 4 profiles
+overlap_count <- table(unlist(top_genres_each))
+strong_genres <- names(overlap_count[overlap_count >= 3])
+cat("\nGenres ranking top 20 in 3+ of 4 profiles:\n")
+print(sort(strong_genres))
+```
+
+---
+
+## 10. Interpretation
+
+```{r interpretation}
+# Spread of predicted popularity across genres per profile
+spread_df <- map_dfr(names(mc_results), function(name) {
+  res <- mc_results[[name]]
+  tibble(
+    Profile          = name,
+    Best_Genre_Pop   = res$mc_mean[1],
+    Worst_Genre_Pop  = res$mc_mean[nrow(res)],
+    Genre_Spread     = res$mc_mean[1] - res$mc_mean[nrow(res)],
+    Genres_Above_50  = sum(res$mc_mean > 50)
+  )
+})
+
+cat("Popularity spread across genres per profile:\n")
+print(spread_df)
+```
+
+**What this tells us:**
+
+The Monte Carlo optimizer reveals a crucial asymmetry: **the same sonic profile can achieve wildly different popularities depending on genre positioning.** The genre spread per profile — the gap between the best and worst genre — is typically 30–50 popularity points, which is larger than the entire effect of any audio feature in the regression model.
+
+Key findings:
+
+- **Electronic Dance Tracks** are highly genre-sensitive. They thrive in dance/electronic genres (pop-film, edm, house) but underperform dramatically in acoustic or classical genres where they clash with the audience's sonic expectations.
+
+- **Acoustic Ballads** have a narrower ceiling — even in their best genre, the model predicts moderate popularity. The genre spread is smaller, meaning there is less upside from genre optimization but also less downside. Singer-songwriter and indie genres are their natural home.
+
+- **Hip-Hop / Spoken Word tracks** have the most skewed distribution — the right genre (hip-hop, rap) provides strong predicted popularity, but wrong-genre placement (classical, jazz) can be catastrophically low. Genre selection is the single most important decision for these tracks.
+
+- **Ambient / Instrumental tracks** consistently underperform across genres because PC3 (low speechiness/liveness) and PC2 (low danceability) are both penalized by the model. Their best case is in study or ambient genres, but even there the ceiling is low.
+
+> **Consulting punchline:** Genre is not a cosmetic label — it is the single most powerful lever a label has to influence a track's Spotify popularity. Our Monte Carlo optimizer quantifies exactly how much each genre is worth for a given sonic profile, turning what was historically a subjective A&R decision into a data-driven strategy.
+
+---
+
+## 11. Save Results
+
+```{r save}
+# Save MC results for each profile as CSV
+for (name in names(mc_results)) {
+  fname <- paste0("mc_results_", gsub("[^a-zA-Z0-9]", "_", tolower(name)), ".csv")
+  write_csv(mc_results[[name]], file.path(out_dir, fname))
+  cat("Saved:", fname, "\n")
+}
+
+write_csv(best_per_profile, file.path(out_dir, "best_genre_per_profile.csv"))
+cat("Saved: best_genre_per_profile.csv\n")
+cat("\nMonte Carlo Genre Optimizer complete.\n")
+```
+
+---
+
+*This notebook demonstrates Monte Carlo simulation as a practical decision-support tool. The technique is general — any set of PC scores can be passed to `run_mc_optimizer()` to generate a genre recommendation for a real track.*

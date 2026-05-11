@@ -1,0 +1,674 @@
+---
+title: "Genre Deep Dive — What Makes a Genre Category Successful?"
+subtitle: "MSDS 16:954:567 – Statistical Models and Computing"
+author: "Rutgers University"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_knit$set(root.dir = "..")
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 8,
+  fig.height = 5,
+  dpi        = 72
+)
+```
+
+## Overview
+
+The regression model confirmed genre as the dominant driver of Spotify popularity, and the Monte Carlo optimizer revealed that genre ranking barely changes regardless of how a song sounds. This notebook asks the next question:
+
+> *What is it about certain genres that makes them structurally dominant on Spotify — and can we find clusters of genres that share the same sonic DNA and popularity potential?*
+
+We answer this in three stages:
+
+1. **EM Gaussian Mixture** — fit a mixture model on genre-level mean popularity to discover natural popularity tiers (Premium, Mid-tier, Niche) without manually defining cutoffs.
+2. **Sonic Fingerprinting + K-means Clustering** — compute each genre's average audio profile (mean PC scores) and cluster the 114 genres into sonic families.
+3. **Cross-analysis** — do certain sonic families dominate the Premium tier? What is the audio fingerprint of a winning genre?
+
+> **Consulting framing:** We are no longer just saying "genre matters." We are decoding *why* it matters — identifying the latent sonic archetypes that Spotify rewards, and giving labels a blueprint for which type of music to invest in.
+
+---
+
+## 1. Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(broom)
+library(factoextra)  # fviz_nbclust, fviz_cluster
+```
+
+---
+
+## 2. Load Data
+
+```{r load-data}
+out_dir <- "../outputs/genre_deepdive"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+df     <- readRDS("../data/spotify_pca.rds")
+df     <- df |> mutate(duration_scaled = as.numeric(scale(duration_ms)))
+model2 <- readRDS("../data/model_full.rds")
+
+cat("Loaded:", nrow(df), "rows ×", ncol(df), "columns\n")
+cat("Genres:", nlevels(df$track_genre), "\n")
+```
+
+```{r helpers, include=FALSE}
+save_plot <- function(plot, filename, width = 8, height = 5, dpi = 72) {
+  path <- file.path(out_dir, filename)
+  ggsave(path, plot = plot, width = width, height = height, dpi = dpi)
+  cat("Saved:", path, "\n")
+}
+
+spotify_green <- "#1DB954"
+spotify_black <- "#121212"
+spotify_gray  <- "#535353"
+spotify_light <- "#F4F4F4"
+
+base_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14,
+                                    margin = margin(b = 6), color = spotify_black),
+    plot.subtitle    = element_text(size = 11, color = spotify_gray,
+                                    margin = margin(b = 10)),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = spotify_light),
+    panel.grid.minor = element_blank(),
+    axis.title       = element_text(size = 11, color = spotify_gray),
+    axis.text        = element_text(color = spotify_gray),
+    strip.text       = element_text(face = "bold", color = spotify_black),
+    legend.text      = element_text(color = spotify_gray),
+    legend.title     = element_text(color = spotify_black)
+  )
+```
+
+---
+
+## 3. Genre-Level Summary Statistics
+
+Compute mean popularity, mean PC scores, and track count per genre. This is the foundation for both the EM clustering and the sonic fingerprinting.
+
+```{r genre-stats}
+genre_stats <- df |>
+  group_by(track_genre) |>
+  summarise(
+    mean_popularity = round(mean(popularity), 2),
+    mean_pc1        = round(mean(pc1), 3),
+    mean_pc2        = round(mean(pc2), 3),
+    mean_pc3        = round(mean(pc3), 3),
+    n_tracks        = n(),
+    .groups         = "drop"
+  ) |>
+  rename(genre = track_genre)
+
+cat("Genre summary (first 10 rows):\n")
+print(head(genre_stats, 10))
+
+cat("\nPopularity range across genres:\n")
+cat("  Max:", max(genre_stats$mean_popularity),
+    "(", genre_stats$genre[which.max(genre_stats$mean_popularity)], ")\n")
+cat("  Min:", min(genre_stats$mean_popularity),
+    "(", genre_stats$genre[which.min(genre_stats$mean_popularity)], ")\n")
+cat("  Spread:", round(diff(range(genre_stats$mean_popularity)), 1), "points\n")
+```
+
+---
+
+## 4. Part 1 — EM Gaussian Mixture: Discovering Genre Popularity Tiers
+
+### 4.1 The EM Algorithm
+
+We implement the EM algorithm from scratch for a K-component univariate Gaussian mixture. The input is the vector of 114 genre mean popularities. EM iterates between:
+
+- **E-step**: compute the posterior probability (responsibility) that each genre belongs to each component, given current parameters.
+- **M-step**: update mixing weights $\pi_k$, means $\mu_k$, and standard deviations $\sigma_k$ using the weighted responsibilities.
+
+```{r em-function}
+run_em_gmm <- function(x, K = 3, max_iter = 300, tol = 1e-8, seed = 42) {
+  set.seed(seed)
+  n <- length(x)
+
+  # --- Initialise with K-means ---
+  km   <- kmeans(x, centers = K, nstart = 20)
+  pi_k <- as.numeric(table(km$cluster) / n)
+  mu_k <- as.numeric(km$centers)
+  sg_k <- tapply(x, km$cluster, sd)
+  sg_k[is.na(sg_k) | sg_k < 0.5] <- sd(x) / K
+
+  log_lik_prev <- -Inf
+
+  for (iter in seq_len(max_iter)) {
+
+    # --- E-step: responsibilities ---
+    r <- sapply(seq_len(K), function(k) pi_k[k] * dnorm(x, mu_k[k], sg_k[k]))
+    r <- r / rowSums(r)
+
+    # --- M-step: update parameters ---
+    n_k  <- colSums(r)
+    pi_k <- n_k / n
+    mu_k <- colSums(r * x) / n_k
+    sg_k <- sqrt(colSums(r * (outer(x, mu_k, "-"))^2) / n_k)
+    sg_k <- pmax(sg_k, 0.3)   # prevent degenerate collapse
+
+    # --- Log-likelihood ---
+    ll <- sum(log(rowSums(
+      sapply(seq_len(K), function(k) pi_k[k] * dnorm(x, mu_k[k], sg_k[k]))
+    )))
+
+    if (abs(ll - log_lik_prev) < tol) break
+    log_lik_prev <- ll
+  }
+
+  # Sort components by ascending mean
+  ord  <- order(mu_k)
+  list(
+    pi      = pi_k[ord],
+    mu      = mu_k[ord],
+    sigma   = sg_k[ord],
+    r       = r[, ord],
+    cluster = apply(r[, ord], 1, which.max),
+    log_lik = ll,
+    n_iter  = iter
+  )
+}
+```
+
+### 4.2 Fit the Mixture Model
+
+```{r em-fit}
+x_pop <- genre_stats$mean_popularity
+
+em3 <- run_em_gmm(x_pop, K = 3)
+
+cat("EM converged in", em3$n_iter, "iterations\n")
+cat("Log-likelihood:", round(em3$log_lik, 3), "\n\n")
+
+cat("Component parameters:\n")
+tibble(
+  Component    = c("Niche", "Mid-tier", "Premium"),
+  Weight       = round(em3$pi, 3),
+  Mean_Pop     = round(em3$mu, 2),
+  SD_Pop       = round(em3$sigma, 2)
+) |> print()
+```
+
+```{r em-assign}
+tier_labels <- c("1_Niche", "2_Mid-tier", "3_Premium")
+
+genre_stats <- genre_stats |>
+  mutate(
+    em_tier     = tier_labels[em3$cluster],
+    em_prob_premium = round(em3$r[, 3], 3)  # P(Premium)
+  )
+
+cat("\nGenre tier distribution:\n")
+print(table(genre_stats$em_tier))
+
+cat("\nPremium tier genres:\n")
+genre_stats |>
+  filter(em_tier == "3_Premium") |>
+  arrange(desc(mean_popularity)) |>
+  select(genre, mean_popularity, em_prob_premium) |>
+  print()
+```
+
+### 4.3 Visualise the EM Mixture
+
+```{r em-density-plot}
+x_seq <- seq(min(x_pop) - 2, max(x_pop) + 2, length.out = 500)
+
+density_df <- map_dfr(seq_len(3), function(k) {
+  tibble(
+    x         = x_seq,
+    density   = em3$pi[k] * dnorm(x_seq, em3$mu[k], em3$sigma[k]),
+    component = tier_labels[k]
+  )
+})
+
+tier_colors <- c("1_Niche" = "#B22222", "2_Mid-tier" = "darkorange",
+                 "3_Premium" = spotify_green)
+
+p_em <- ggplot() +
+  geom_histogram(data = tibble(x = x_pop),
+                 aes(x = x, y = after_stat(density)),
+                 bins = 20, fill = spotify_gray, alpha = 0.4, color = "white") +
+  geom_line(data = density_df,
+            aes(x = x, y = density, color = component),
+            linewidth = 1.2) +
+  geom_line(
+    data = tibble(
+      x = x_seq,
+      y = rowSums(sapply(seq_len(3), function(k)
+        em3$pi[k] * dnorm(x_seq, em3$mu[k], em3$sigma[k])))
+    ),
+    aes(x = x, y = y),
+    color = spotify_black, linewidth = 1, linetype = "dashed"
+  ) +
+  geom_vline(xintercept = em3$mu, linetype = "dotted",
+             color = c("#B22222", "darkorange", spotify_green),
+             linewidth = 0.8) +
+  scale_color_manual(values = tier_colors, name = "Tier") +
+  labs(
+    title    = "EM Gaussian Mixture — Genre Popularity Tiers",
+    subtitle = "3-component GMM fitted via EM algorithm | Dashed = mixture density",
+    x        = "Mean Genre Popularity",
+    y        = "Density"
+  ) +
+  base_theme
+
+p_em
+save_plot(p_em, "01_em_mixture_density.png")
+```
+
+```{r em-genre-plot, fig.height=9}
+p_em_genres <- genre_stats |>
+  mutate(genre = fct_reorder(genre, mean_popularity)) |>
+  ggplot(aes(x = mean_popularity, y = genre, fill = em_tier)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = tier_colors,
+                    labels = c("Niche", "Mid-tier", "Premium"),
+                    name   = "EM Tier") +
+  labs(
+    title    = "All 114 Genres — Ranked by Mean Popularity and EM Tier",
+    subtitle = "Colour assigned by EM Gaussian Mixture (K = 3)",
+    x        = "Mean Popularity",
+    y        = NULL
+  ) +
+  base_theme +
+  theme(axis.text.y = element_text(size = 6),
+        panel.grid.major.y = element_blank())
+
+p_em_genres
+save_plot(p_em_genres, "02_em_genre_ranking.png", height = 14)
+```
+
+---
+
+## 5. Part 2 — Sonic Fingerprinting: The Average Sound of Each Genre
+
+Each genre has an "average sound" — the centroid of its tracks in PCA space. A genre dominated by loud, high-energy tracks will have a strongly negative mean PC1. A genre full of danceable, upbeat tracks will have a high mean PC2.
+
+```{r fingerprint-viz, fig.height=6}
+p_fp <- ggplot(genre_stats, aes(x = mean_pc1, y = mean_pc2,
+                                 color = mean_popularity, size = mean_popularity)) +
+  geom_point(alpha = 0.75) +
+  ggrepel::geom_text_repel(
+    data = genre_stats |> filter(mean_popularity > 50 | mean_popularity < 15),
+    aes(label = genre),
+    size = 2.8, color = spotify_black, max.overlaps = 20
+  ) +
+  scale_color_gradient(low = "#B22222", high = spotify_green,
+                       name = "Mean\nPopularity") +
+  scale_size_continuous(range = c(1, 6), guide = "none") +
+  labs(
+    title    = "Genre Sonic Fingerprints — PC1 vs PC2",
+    subtitle = "Each point = one genre | Size and colour = mean popularity",
+    x        = "Mean PC1  (← Electronic | Acoustic →)",
+    y        = "Mean PC2  (← Melancholic | Danceable/Positive →)"
+  ) +
+  base_theme
+
+# ggrepel may not be installed — fall back gracefully
+tryCatch({
+  print(p_fp)
+  save_plot(p_fp, "03_genre_fingerprints_pc1_pc2.png", height = 6)
+}, error = function(e) {
+  # Without ggrepel
+  p_fp2 <- ggplot(genre_stats, aes(x = mean_pc1, y = mean_pc2,
+                                    color = mean_popularity, size = mean_popularity)) +
+    geom_point(alpha = 0.75) +
+    scale_color_gradient(low = "#B22222", high = spotify_green,
+                         name = "Mean\nPopularity") +
+    scale_size_continuous(range = c(1, 6), guide = "none") +
+    labs(
+      title    = "Genre Sonic Fingerprints — PC1 vs PC2",
+      subtitle = "Each point = one genre | Size and colour = mean popularity",
+      x        = "Mean PC1  (← Electronic | Acoustic →)",
+      y        = "Mean PC2  (← Melancholic | Danceable/Positive →)"
+    ) +
+    base_theme
+  print(p_fp2)
+  save_plot(p_fp2, "03_genre_fingerprints_pc1_pc2.png", height = 6)
+})
+```
+
+---
+
+## 6. Part 3 — K-means: Genre Families
+
+### 6.1 Choose K — Elbow Plot
+
+```{r elbow}
+fingerprint_mat <- genre_stats |>
+  select(mean_pc1, mean_pc2, mean_pc3) |>
+  scale()   # standardise across genres before clustering
+
+set.seed(42)
+wss <- map_dbl(1:10, function(k) {
+  kmeans(fingerprint_mat, centers = k, nstart = 25)$tot.withinss
+})
+
+p_elbow <- ggplot(tibble(k = 1:10, wss = wss), aes(x = k, y = wss)) +
+  geom_line(color = spotify_green, linewidth = 1) +
+  geom_point(color = spotify_black, size = 3) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Elbow Plot — Choosing K for Genre Clustering",
+    x     = "Number of Clusters (K)",
+    y     = "Total Within-Cluster SS"
+  ) +
+  base_theme
+
+p_elbow
+save_plot(p_elbow, "04_elbow_plot.png")
+```
+
+### 6.2 Fit K-means (K = 5)
+
+```{r kmeans}
+set.seed(42)
+K_chosen <- 5
+km_fit   <- kmeans(fingerprint_mat, centers = K_chosen, nstart = 50)
+
+genre_stats <- genre_stats |>
+  mutate(cluster = factor(paste0("C", km_fit$cluster)))
+
+cat("Genre counts per cluster:\n")
+print(table(genre_stats$cluster))
+```
+
+### 6.3 Cluster Sonic Profiles — What Does Each Family Sound Like?
+
+```{r cluster-profiles}
+cluster_profiles <- genre_stats |>
+  group_by(cluster) |>
+  summarise(
+    n_genres        = n(),
+    mean_popularity = round(mean(mean_popularity), 2),
+    mean_pc1        = round(mean(mean_pc1), 3),
+    mean_pc2        = round(mean(mean_pc2), 3),
+    mean_pc3        = round(mean(mean_pc3), 3),
+    top_genre       = genre[which.max(mean_popularity)],
+    bottom_genre    = genre[which.min(mean_popularity)],
+    .groups         = "drop"
+  ) |>
+  arrange(desc(mean_popularity))
+
+cat("Cluster summary (sorted by mean popularity):\n")
+print(cluster_profiles)
+```
+
+```{r cluster-label}
+# Label clusters by their dominant PC characteristic
+cluster_labels <- cluster_profiles |>
+  mutate(label = case_when(
+    mean_pc2 == max(mean_pc2)  ~ "Dance & Pop",
+    mean_pc1 == max(mean_pc1)  ~ "Acoustic & Folk",
+    mean_pc3 == max(mean_pc3)  ~ "Live & Vocal",
+    mean_pc1 == min(mean_pc1)  ~ "Electronic & Loud",
+    TRUE                        ~ "Balanced / Rock"
+  )) |>
+  select(cluster, label, mean_popularity)
+
+genre_stats <- genre_stats |>
+  left_join(cluster_labels |> select(cluster, label), by = "cluster")
+
+cat("\nCluster labels:\n")
+print(cluster_labels)
+```
+
+### 6.4 Visualise Clusters in Sonic Space
+
+```{r cluster-scatter, fig.height=6}
+cluster_colors <- c("#1DB954", "#2196F3", "#FF9800", "#E91E63", "#9C27B0")
+
+p_clusters <- ggplot(genre_stats,
+                     aes(x = mean_pc1, y = mean_pc2,
+                         color = label, size = mean_popularity)) +
+  geom_point(alpha = 0.8) +
+  scale_color_manual(values = cluster_colors, name = "Genre Family") +
+  scale_size_continuous(range = c(1.5, 7), name = "Mean\nPopularity") +
+  labs(
+    title    = "Genre Families in Sonic Space",
+    subtitle = "K-means clustering (K=5) on mean PC scores | Size = mean popularity",
+    x        = "Mean PC1  (← Electronic | Acoustic →)",
+    y        = "Mean PC2  (← Melancholic | Danceable/Positive →)"
+  ) +
+  base_theme +
+  theme(legend.position = "right")
+
+p_clusters
+save_plot(p_clusters, "05_genre_clusters_scatter.png", height = 6)
+```
+
+---
+
+## 7. Part 4 — Sonic DNA of Winning Genres
+
+### 7.1 Do EM Tiers Align with Genre Families?
+
+```{r tier-cluster-cross}
+cross_tab <- genre_stats |>
+  count(label, em_tier) |>
+  pivot_wider(names_from = em_tier, values_from = n, values_fill = 0)
+
+cat("Genre family × EM popularity tier:\n")
+print(cross_tab)
+```
+
+```{r tier-cluster-plot}
+p_cross <- genre_stats |>
+  count(label, em_tier) |>
+  mutate(
+    em_tier = recode(em_tier,
+                     "1_Niche"    = "Niche",
+                     "2_Mid-tier" = "Mid-tier",
+                     "3_Premium"  = "Premium")
+  ) |>
+  ggplot(aes(x = label, y = n, fill = em_tier)) +
+  geom_col(position = "fill", width = 0.7) +
+  scale_fill_manual(
+    values = c("Niche" = "#B22222", "Mid-tier" = "darkorange",
+               "Premium" = spotify_green),
+    name = "Popularity Tier"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title    = "Genre Family Composition by Popularity Tier",
+    subtitle = "What fraction of each sonic family reaches Premium status?",
+    x        = "Genre Family",
+    y        = "Proportion of Genres"
+  ) +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+
+p_cross
+save_plot(p_cross, "06_tier_by_family.png")
+```
+
+### 7.2 Sonic Fingerprint Heatmap — What Audio Profile Does Each Family Have?
+
+```{r fingerprint-heatmap}
+heatmap_df <- cluster_profiles |>
+  select(cluster, mean_pc1, mean_pc2, mean_pc3) |>
+  left_join(cluster_labels |> select(cluster, label), by = "cluster") |>
+  pivot_longer(c(mean_pc1, mean_pc2, mean_pc3),
+               names_to = "dimension", values_to = "value") |>
+  mutate(
+    dimension = recode(dimension,
+                       mean_pc1 = "PC1\n(Acoustic vs Electronic)",
+                       mean_pc2 = "PC2\n(Danceability & Valence)",
+                       mean_pc3 = "PC3\n(Liveness & Speechiness)"),
+    label = fct_reorder(label, value, .fun = sum)
+  )
+
+p_heatmap <- ggplot(heatmap_df,
+                    aes(x = dimension, y = label, fill = value)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = round(value, 2)),
+            size = 3.5, color = spotify_black) +
+  scale_fill_gradient2(
+    low      = "#B22222",
+    mid      = "white",
+    high     = spotify_green,
+    midpoint = 0,
+    name     = "Mean\nPC Score"
+  ) +
+  labs(
+    title    = "Sonic Fingerprint Heatmap by Genre Family",
+    subtitle = "Mean PC score per genre cluster — what does each family sound like?",
+    x        = NULL,
+    y        = NULL
+  ) +
+  base_theme +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(size = 9))
+
+p_heatmap
+save_plot(p_heatmap, "07_fingerprint_heatmap.png")
+```
+
+### 7.3 Popularity Distribution by Genre Family
+
+```{r pop-by-family, fig.height=5}
+p_boxplot <- genre_stats |>
+  mutate(label = fct_reorder(label, mean_popularity, .fun = median)) |>
+  ggplot(aes(x = label, y = mean_popularity, fill = label)) +
+  geom_boxplot(width = 0.5, outlier.shape = 21,
+               outlier.fill = "white", outlier.color = spotify_gray) +
+  geom_jitter(width = 0.15, alpha = 0.5, size = 1.5, color = spotify_black) +
+  scale_fill_manual(values = cluster_colors, guide = "none") +
+  labs(
+    title    = "Mean Popularity Distribution by Genre Family",
+    subtitle = "Each dot = one genre | Box = IQR",
+    x        = "Genre Family",
+    y        = "Mean Popularity"
+  ) +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+
+p_boxplot
+save_plot(p_boxplot, "08_popularity_by_family.png")
+```
+
+---
+
+## 8. The Money Plot — Sonic Space Coloured by EM Tier
+
+```{r money-plot, fig.height=6, fig.width=9}
+tier_colors_named <- c("1_Niche" = "#B22222",
+                        "2_Mid-tier" = "darkorange",
+                        "3_Premium"  = spotify_green)
+
+p_money <- ggplot(genre_stats,
+                  aes(x = mean_pc1, y = mean_pc2,
+                      color = em_tier, size = mean_popularity)) +
+  geom_point(alpha = 0.85) +
+  # Label top 8 and bottom 5 genres
+  geom_text(
+    data = bind_rows(
+      slice_max(genre_stats, mean_popularity, n = 8),
+      slice_min(genre_stats, mean_popularity, n = 5)
+    ),
+    aes(label = genre),
+    vjust = -0.9, size = 2.7, color = spotify_black, fontface = "bold"
+  ) +
+  # Draw centroid of each EM tier
+  stat_summary(
+    aes(group = em_tier),
+    fun.x = mean, fun.y = mean,
+    geom = "point", shape = 3,
+    size = 5, stroke = 1.5, color = spotify_black
+  ) +
+  scale_color_manual(
+    values = tier_colors_named,
+    labels = c("Niche", "Mid-tier", "Premium"),
+    name   = "Popularity Tier\n(EM)"
+  ) +
+  scale_size_continuous(range = c(1.5, 8), name = "Mean\nPopularity") +
+  annotate("rect",
+           xmin = -Inf, xmax = 0, ymin = 0, ymax = Inf,
+           fill = spotify_green, alpha = 0.04) +
+  annotate("text", x = -0.25, y = max(genre_stats$mean_pc2) * 0.95,
+           label = "Electronic + Danceable\n(Spotify sweet spot)",
+           color = spotify_green, size = 3, fontface = "italic", hjust = 1) +
+  labs(
+    title    = "The Spotify Success Map — Genre Sonic Space",
+    subtitle = "Colour = EM popularity tier | Size = mean popularity | + = tier centroid",
+    x        = "Mean PC1  (← Electronic & Loud  |  Acoustic & Quiet →)",
+    y        = "Mean PC2  (← Melancholic & Slow  |  Danceable & Positive →)"
+  ) +
+  base_theme +
+  theme(legend.position = "right")
+
+p_money
+save_plot(p_money, "09_spotify_success_map.png", width = 10, height = 6)
+```
+
+---
+
+## 9. Interpretation — The Blueprint of a Winning Genre
+
+```{r final-summary}
+cat("=== GENRE TIER SUMMARY ===\n\n")
+
+for (tier in c("3_Premium", "2_Mid-tier", "1_Niche")) {
+  sub <- genre_stats |> filter(em_tier == tier)
+  cat(tier, "—", nrow(sub), "genres\n")
+  cat("  Mean popularity:", round(mean(sub$mean_popularity), 1), "\n")
+  cat("  Mean PC1:", round(mean(sub$mean_pc1), 3),
+      "| PC2:", round(mean(sub$mean_pc2), 3),
+      "| PC3:", round(mean(sub$mean_pc3), 3), "\n")
+  cat("  Top genres:", paste(head(sub$genre[order(-sub$mean_popularity)], 5),
+                              collapse = ", "), "\n\n")
+}
+```
+
+**What this tells us:**
+
+The EM algorithm identifies three structurally distinct genre tiers, and the sonic fingerprints of those tiers reveal a clear pattern:
+
+- **Premium genres** (pop-film, k-pop, pop, electro, house) cluster in the **electronic-to-neutral PC1 zone with high PC2** — they are moderately to highly energetic, strongly danceable, and emotionally positive. Low PC3 confirms they are clean studio productions with minimal live or spoken-word content.
+
+- **Mid-tier genres** span a wider sonic range but tend to sit near the PC1/PC2 origin — they are sonically average, neither distinctly acoustic nor electronic, neither strongly danceable nor melancholic.
+
+- **Niche genres** (iranian, romance, grindcore, detroit-techno) occupy the extremes — either highly acoustic and quiet (high PC1, low PC2) or aggressively loud and non-danceable (low PC1, low PC2). Both extremes underperform on Spotify, which optimizes for accessible, pleasant listening experiences.
+
+**The blueprint of a winning genre on Spotify:**
+
+| Dimension | Premium Genre Profile |
+|---|---|
+| PC1 (Acoustic vs Electronic) | Neutral to slightly electronic (−0.3 to 0) |
+| PC2 (Danceability & Valence) | Positive (danceable, upbeat) |
+| PC3 (Liveness & Speechiness) | Low (clean studio production) |
+| Platform fit | Playlist-friendly, mainstream audience, algorithm-compatible |
+
+> **Consulting punchline:** Genre is not just a marketing label — it is a sonic contract with an audience. The genres that win on Spotify are those that make a specific promise: *danceable, positive, studio-clean*. Labels that understand this blueprint can evaluate not just whether a track fits a genre, but whether the genre itself is positioned in the Spotify sweet spot.
+
+---
+
+## 10. Save Outputs
+
+```{r save}
+write_csv(genre_stats,      file.path(out_dir, "genre_stats_full.csv"))
+write_csv(cluster_profiles, file.path(out_dir, "cluster_profiles.csv"))
+
+cat("Saved: genre_stats_full.csv\n")
+cat("Saved: cluster_profiles.csv\n")
+cat("\nGenre deep dive complete.\n")
+```
+
+---
+
+*This notebook uses the EM algorithm (unsupervised learning) and K-means clustering (nonparametric) to decode the structural reasons behind genre-level popularity differences on Spotify.*
